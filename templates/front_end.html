@@ -8,10 +8,18 @@
 
     <h1>Search for Nutrition Info</h1>
 
+    <!-- Normal Text Search -->
     <form action="/foods/search" method="get">
-        <input type="text" name="query" placeholder="Enter food name" required>
+        <input type="text" name="query" id="queryInput" placeholder="Enter food name" required>
         <button type="submit">Search</button>
     </form>
+
+    <br>
+
+    <!-- Voice Button -->
+    <button onclick="startRecording()">🎤 Speak Food</button>
+
+    <p id="status"></p>
 
     {% if result %}
         <h2>{{ result.food }}</h2>
@@ -58,6 +66,56 @@
             </tr>
         </table>
     {% endif %}
+
+<script>
+
+let mediaRecorder;
+let audioChunks = [];
+
+async function startRecording() {
+
+    document.getElementById("status").innerText = "Listening...";
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    mediaRecorder = new MediaRecorder(stream);
+
+    audioChunks = [];
+
+    mediaRecorder.ondataavailable = event => {
+        audioChunks.push(event.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+
+        document.getElementById("status").innerText = "Processing voice...";
+
+        const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+
+        const formData = new FormData();
+        formData.append("file", audioBlob, "speech.webm");
+
+        const response = await fetch("/transcribe", {
+            method: "POST",
+            body: formData
+        });
+
+        const data = await response.json();
+
+        document.getElementById("status").innerText = "Heard: " + data.text;
+
+        // Automatically search with the transcript
+        window.location.href = "/foods/search?query=" + encodeURIComponent(data.text);
+    };
+
+    mediaRecorder.start();
+
+    setTimeout(() => {
+        mediaRecorder.stop();
+    }, 3000); // record for 3 seconds
+}
+
+</script>
 
 </body>
 </html>

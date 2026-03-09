@@ -5,17 +5,19 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from fastapi import UploadFile, File
+from openai import OpenAI
 from dotenv import load_dotenv
+load_dotenv()
 import httpx
 import os
 
 from supabase_client import supabase
 
 app = FastAPI()
-load_dotenv()
+client = OpenAI()
 
 USDA_API_KEY = os.getenv("USDA_API_KEY")
-SupaBase_Service_Role = os.getenv("SupaBase_Service_Role")
 
 if not USDA_API_KEY:
     raise RuntimeError("USDA_API_KEY environment variable not set")
@@ -117,3 +119,15 @@ async def usda_api(request: Request, query: str):
             "result": result
         }
     )
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+
+    audio_bytes = await file.read()
+
+    transcript = client.audio.transcriptions.create(
+        model="gpt-4o-mini-transcribe",
+        file=("speech.webm", audio_bytes)
+    )
+
+    return {"text": transcript.text}
