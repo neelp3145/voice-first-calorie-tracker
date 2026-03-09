@@ -1,35 +1,47 @@
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from fastapi import UploadFile, File
-from openai import OpenAI
 from dotenv import load_dotenv
 load_dotenv()
-import httpx
+
 import os
+import httpx
+
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from openai import OpenAI
 
 from supabase_client import supabase
 
+
 app = FastAPI()
 
+# Load environment variables
 USDA_API_KEY = os.getenv("USDA_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not USDA_API_KEY:
     raise RuntimeError("USDA_API_KEY environment variable not set")
 
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY environment variable not set")
+
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 templates = Jinja2Templates(directory="templates")
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request) -> HTMLResponse:
     return templates.TemplateResponse("front_end.html", {"request": request})
+
 
 @app.get("/foods/search", response_class=HTMLResponse)
 async def usda_api(request: Request, query: str):
 
     params = {"api_key": USDA_API_KEY}
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
+    async with httpx.AsyncClient() as http_client:
+        response = await http_client.post(
             "https://api.nal.usda.gov/fdc/v1/foods/search",
             params=params,
             json={
@@ -99,13 +111,17 @@ async def usda_api(request: Request, query: str):
         **nutrition_data
     }
 
-    supabase.table("food_searches").insert({
-        "food_name": result["food"],
-        "calories": result["calories"],
-        "protein": result["protein_g"],
-        "carbs": result["carbs_g"],
-        "fat": result["fat_g"]
-    }).execute()
+    # Insert into Supabase with error protection
+    try:
+        supabase.table("food_searches").insert({
+            "food_name": result["food"],
+            "calories": result["calories"],
+            "protein": result["protein_g"],
+            "carbs": result["carbs_g"],
+            "fat": result["fat_g"]
+        }).execute()
+    except Exception as e:
+        print("Supabase insert failed:", e)
 
     return templates.TemplateResponse(
         "front_end.html",
@@ -114,6 +130,7 @@ async def usda_api(request: Request, query: str):
             "result": result
         }
     )
+
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
