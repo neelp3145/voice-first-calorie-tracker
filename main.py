@@ -177,7 +177,7 @@ async def usda_api(request: Request, query: str):
             result = {
                 "food": f"{quantity} x {selected_food['description']}",
                 "calories": (nutrition_data["calories"] or 0) * quantity,
-                "protein_g": (nutrition_data["protein_g"] or 0) * quantity,
+                "protein_g": (nutrition_data["protein_g"] or 0) * round(quantity, 3),
                 "carbs_g": (nutrition_data["carbs_g"] or 0) * quantity,
                 "fat_g": (nutrition_data["fat_g"] or 0) * quantity,
                 "sugar_g": (nutrition_data["sugar_g"] or 0) * quantity,
