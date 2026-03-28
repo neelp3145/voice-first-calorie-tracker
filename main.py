@@ -3,8 +3,9 @@ load_dotenv()
 
 import os
 import httpx
-import re
 import string
+import json
+import re
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -12,52 +13,65 @@ from fastapi.templating import Jinja2Templates
 
 from supabase_client import supabase
 
+import google.generativeai as genai
+from tavily import TavilyClient
+
 app = FastAPI()
 
+# ------------------ API KEYS ------------------
+
 USDA_API_KEY = os.getenv("USDA_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 if not USDA_API_KEY:
-    raise RuntimeError("USDA_API_KEY environment variable not set")
+    raise RuntimeError("USDA_API_KEY not set")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY not set")
+
+if not TAVILY_API_KEY:
+    raise RuntimeError("TAVILY_API_KEY not set")
+
+# ------------------ GEMINI SETUP ------------------
+
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
 templates = Jinja2Templates(directory="templates")
 
+# ------------------ ROUTE ------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     return templates.TemplateResponse("front_end.html", {"request": request})
 
 
-def convert_number_words(query: str):
+# ------------------ JSON EXTRACTION HELPER ------------------
 
-    number_map = {
-        "one": "1",
-        "two": "2",
-        "three": "3",
-        "four": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "nine": "9",
-        "ten": "10"
-    }
+def extract_json(text):
+    """
+    Extracts JSON from Gemini response safely.
+    Handles both list [] and dict {} outputs.
+    """
+    try:
+        match = re.search(r"\[.*\]|\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except Exception as e:
+        print("JSON extraction error:", e)
+    return None
 
-    words = query.split()
 
-    converted = [number_map.get(w, w) for w in words]
-
-    return " ".join(converted)
-
+# ------------------ CLEAN INPUT ------------------
 
 def clean_voice_input(query: str):
 
     fillers = [
-        "i ate",
-        "i had",
-        "i just ate",
-        "for breakfast",
-        "for lunch",
-        "for dinner"
+        "i ate", "i had", "i just ate",
+        "for breakfast", "for lunch", "for dinner"
     ]
 
     query = query.lower()
@@ -70,48 +84,173 @@ def clean_voice_input(query: str):
     return query.strip()
 
 
-# Improved splitting logic
-def split_foods(query: str):
+# ------------------ AI FOOD EXTRACTION ------------------
 
-    # normalize separators
-    query = query.replace(" with ", " and ")
-    query = query.replace("&", " and ")
-    query = query.replace(",", " and ")
+async def extract_foods_with_ai(query: str):
 
-    foods = [f.strip() for f in query.split(" and ")]
+    prompt = f"""
+    Extract food items with quantities.
 
-    # remove articles like "a banana"
-    cleaned = []
-    for food in foods:
-        words = food.split()
-        if words and words[0] in ["a", "an", "the"]:
-            food = " ".join(words[1:])
-        cleaned.append(food)
+    Return ONLY valid JSON list like:
+    [
+      {{"food": "egg", "quantity": 2, "unit": "whole"}},
+      {{"food": "toast", "quantity": 2, "unit": "slice"}}
+    ]
 
-    return cleaned
+    If quantity missing, assume 1.
+
+    Sentence: "{query}"
+    """
+
+    response = model.generate_content(prompt)
+    data = extract_json(response.text)
+
+    if data:
+        return data
+
+    return [{"food": query, "quantity": 1, "unit": "serving"}]
 
 
-def parse_food_quantity(food_phrase: str):
+# ------------------ USDA FETCH ------------------
 
-    match = re.match(r"(\d+)\s+(.*)", food_phrase)
+async def fetch_usda(food_name: str):
 
-    if match:
-        quantity = int(match.group(1))
-        food_name = match.group(2)
+    async with httpx.AsyncClient() as http_client:
+
+        response = await http_client.post(
+            "https://api.nal.usda.gov/fdc/v1/foods/search",
+            params={"api_key": USDA_API_KEY},
+            json={
+                "query": food_name,
+                "dataType": [
+                    "Foundation",
+                    "Branded Foods",
+                    "SR Legacy",
+                    "Survey (FNDDS)"
+                ]
+            }
+        )
+
+        if response.status_code != 200:
+            return None
+
+        foods = response.json().get("foods", [])
+        if not foods:
+            return None
+
+        selected_food = foods[0]
+
+        nutrient_lookup = {
+            "Energy": "calories",
+            "Protein": "protein_g",
+            "Carbohydrate, by difference": "carbs_g",
+            "Total lipid (fat)": "fat_g",
+            "Total Sugars": "sugar_g",
+            "Fiber, total dietary": "fiber_g",
+        }
+
+        nutrition_data = {v: 0 for v in nutrient_lookup.values()}
+
+        for nutrient in selected_food["foodNutrients"]:
+            name = nutrient["nutrientName"]
+            if name in nutrient_lookup:
+                nutrition_data[nutrient_lookup[name]] = nutrient["value"]
+
+        return nutrition_data
+
+
+# ------------------ WEB SEARCH TOOL ------------------
+
+def search_food_nutrition(food_name):
+
+    results = tavily.search(
+        query=f"{food_name} nutrition macros per serving",
+        max_results=3
+    )
+
+    return results
+
+
+# ------------------ EXTRACT MACROS FROM WEB ------------------
+
+async def extract_macros_from_text(web_results):
+
+    prompt = f"""
+    Extract nutrition macros from this data.
+
+    Return JSON:
+    {{
+      "calories": number,
+      "protein_g": number,
+      "carbs_g": number,
+      "fat_g": number
+    }}
+
+    Data:
+    {web_results}
+    """
+
+    response = model.generate_content(prompt)
+    return extract_json(response.text)
+
+
+# ------------------ VALIDATION AGENT ------------------
+
+async def validate_macros(food_name, macros):
+
+    prompt = f"""
+    Validate these macros for realism.
+
+    Food: {food_name}
+    Macros: {macros}
+
+    Fix if needed. Return JSON only.
+    """
+
+    response = model.generate_content(prompt)
+    validated = extract_json(response.text)
+
+    return validated if validated else macros
+
+
+# ------------------ AGENT DECISION ------------------
+
+async def get_best_nutrition(food):
+
+    name = food["food"]
+    quantity = food.get("quantity", 1)
+
+    usda_data = await fetch_usda(name)
+
+    if not usda_data or usda_data.get("calories", 0) == 0:
+
+        web_results = search_food_nutrition(name)
+        web_data = await extract_macros_from_text(web_results)
+
+        if web_data:
+            final = web_data
+        else:
+            final = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}
     else:
-        quantity = 1
-        food_name = food_phrase
+        final = usda_data
 
-    return quantity, food_name
+    validated = await validate_macros(name, final)
 
+    # scale by quantity
+    for k in validated:
+        validated[k] *= quantity
+
+    return validated
+
+
+# ------------------ MAIN ENDPOINT ------------------
 
 @app.get("/foods/search", response_class=HTMLResponse)
 async def usda_api(request: Request, query: str):
 
     query = clean_voice_input(query)
-    query = convert_number_words(query)
 
-    foods_to_search = split_foods(query)
+    foods = await extract_foods_with_ai(query)
 
     results = []
 
@@ -125,86 +264,37 @@ async def usda_api(request: Request, query: str):
         "vitamin_d_mcg": 0
     }
 
-    async with httpx.AsyncClient() as http_client:
+    for food in foods:
 
-        for food_phrase in foods_to_search:
+        nutrition = await get_best_nutrition(food)
 
-            quantity, food_query = parse_food_quantity(food_phrase)
+        result = {
+            "food": f"{food['quantity']} x {food['food']}",
+            "calories": nutrition.get("calories", 0),
+            "protein_g": nutrition.get("protein_g", 0),
+            "carbs_g": nutrition.get("carbs_g", 0),
+            "fat_g": nutrition.get("fat_g", 0),
+            "sugar_g": nutrition.get("sugar_g", 0),
+            "fiber_g": nutrition.get("fiber_g", 0),
+            "vitamin_d_mcg": 0
+        }
 
-            params = {"api_key": USDA_API_KEY}
+        results.append(result)
 
-            response = await http_client.post(
-                "https://api.nal.usda.gov/fdc/v1/foods/search",
-                params=params,
-                json={
-                    "query": food_query,
-                    "dataType": [
-                        "Foundation",
-                        "Branded Foods",
-                        "SR Legacy",
-                        "Survey (FNDDS)"
-                    ]
-                }
-            )
+        for key in totals:
+            totals[key] += result.get(key, 0)
 
-            if response.status_code != 200:
-                continue
-
-            foods = response.json().get("foods", [])
-
-            if not foods:
-                continue
-
-            selected_food = foods[0]
-
-            nutrient_lookup = {
-                "Energy": "calories",
-                "Protein": "protein_g",
-                "Carbohydrate, by difference": "carbs_g",
-                "Total lipid (fat)": "fat_g",
-                "Total Sugars": "sugar_g",
-                "Fiber, total dietary": "fiber_g",
-                "Vitamin D (D2 + D3)": "vitamin_d_mcg"
-            }
-
-            nutrition_data = {v: None for v in nutrient_lookup.values()}
-
-            for nutrient in selected_food["foodNutrients"]:
-                name = nutrient["nutrientName"]
-                if name in nutrient_lookup:
-                    nutrition_data[nutrient_lookup[name]] = nutrient["value"]
-
-            result = {
-                "food": f"{quantity} x {selected_food['description']}",
-                "calories": (nutrition_data["calories"] or 0) * quantity,
-                "protein_g": (nutrition_data["protein_g"] or 0) * round(quantity, 3),
-                "carbs_g": (nutrition_data["carbs_g"] or 0) * quantity,
-                "fat_g": (nutrition_data["fat_g"] or 0) * quantity,
-                "sugar_g": (nutrition_data["sugar_g"] or 0) * quantity,
-                "fiber_g": (nutrition_data["fiber_g"] or 0) * quantity,
-                "vitamin_d_mcg": (nutrition_data["vitamin_d_mcg"] or 0) * quantity
-            }
-
-            results.append(result)
-
-            totals["calories"] += result["calories"]
-            totals["protein_g"] += result["protein_g"]
-            totals["carbs_g"] += result["carbs_g"]
-            totals["fat_g"] += result["fat_g"]
-            totals["sugar_g"] += result["sugar_g"]
-            totals["fiber_g"] += result["fiber_g"]
-            totals["vitamin_d_mcg"] += result["vitamin_d_mcg"]
-
-            try:
-                supabase.table("food_searches").insert({
-                    "food_name": result["food"],
-                    "calories": result["calories"],
-                    "protein": result["protein_g"],
-                    "carbs": result["carbs_g"],
-                    "fat": result["fat_g"]
-                }).execute()
-            except Exception as e:
-                print("Supabase insert failed:", e)
+        # Save to Supabase
+        try:
+            supabase.table("food_searches").insert({
+                "food_name": result["food"],
+                "calories": result["calories"],
+                "protein": result["protein_g"],
+                "carbs": result["carbs_g"],
+                "fat": result["fat_g"]
+            }).execute()
+        except Exception as e:
+            print("Supabase insert failed:", e)
 
     return templates.TemplateResponse(
         "front_end.html",
