@@ -64,23 +64,29 @@ def safe_groq_call(prompt: str):
             messages=[
                 {
                     "role": "system",
-                    "content": """
+                    "content":"""
 You are a STRICT food parser.
 
-Return ONLY valid JSON. No text. No explanations.
+Return ONLY valid JSON.
 
-Format:
+TWO possible formats:
+
+1. If the input is a list of separate foods:
 [
   {"food": "egg", "quantity": 2},
   {"food": "milk", "quantity": 1, "unit": "cup"}
 ]
 
+2. If the input is a SINGLE COMPOSED DISH:
+{
+  "dish": "chicken alfredo pasta"
+}
+
 Rules:
-- Ignore filler words (and, of, a, the)
-- Convert words to numbers ("two" -> 2)
-- Combine phrases ("glass of milk" -> milk, unit=glass)
-- Never split into meaningless tokens
-- Only return real food items
+- If foods are combined into one meal (e.g., "chicken alfredo pasta", "burger with fries"), treat as ONE dish
+- If clearly separate items (e.g., "2 eggs and milk"), split them
+- Convert words to numbers
+- Return ONLY JSON
 """
                 },
                 {"role": "user", "content": prompt}
@@ -182,6 +188,9 @@ async def fetch_usda(food_name: str):
             "Protein": "protein_g",
             "Carbohydrate, by difference": "carbs_g",
             "Total lipid (fat)": "fat_g",
+            "Sugars": "sugar_g",
+            "Fiber, total dietary": "fiber_g",
+            "Vitamin D (D2 + D3)": "vitamin_d_mcg",
         }
         nutrition_data = {v: 0 for v in nutrient_lookup.values()}
 
@@ -216,7 +225,10 @@ async def usda_api(request: Request, query: str):
         "calories": 0,
         "protein_g": 0,
         "carbs_g": 0,
-        "fat_g": 0
+        "fat_g": 0,
+        "sugar_g": 0,
+        "fiber_g": 0,
+        "vitamin_d_mcg": 0
     }
 
     for food in foods:
@@ -226,7 +238,10 @@ async def usda_api(request: Request, query: str):
                 "calories": 0,
                 "protein_g": 0,
                 "carbs_g": 0,
-                "fat_g": 0
+                "fat_g": 0,
+                "sugar_g": 0,
+                "fiber_g": 0,
+                "vitamin_d_mcg": 0
             }
 
         for k in nutrition:
