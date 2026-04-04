@@ -6,7 +6,7 @@ import httpx
 import json
 import re
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
@@ -28,6 +28,12 @@ if not USDA_API_KEY:
 # ------------------ CLIENTS ------------------
 
 groq_client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
+
+# ✅ Whisper client (same Groq endpoint)
+stt_client = OpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1"
 )
@@ -55,6 +61,32 @@ def clean_voice_input(query: str):
     return query.strip()
 
 
+# ------------------ NORMALIZE TRANSCRIPT ------------------
+
+def normalize_transcript(text: str):
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    return text.strip()
+
+
+# ------------------ WHISPER STT ------------------
+
+async def transcribe_audio(file):
+    try:
+        audio_bytes = await file.read()
+
+        response = stt_client.audio.transcriptions.create(
+            file=("audio.wav", audio_bytes),
+            model="whisper-large-v3-turbo"
+        )
+
+        return response.text
+
+    except Exception as e:
+        print("Whisper error:", e)
+        return None
+
+
 # ------------------ SAFE GROQ CALL ------------------
 
 def safe_groq_call(prompt: str):
@@ -64,185 +96,7 @@ def safe_groq_call(prompt: str):
             messages=[
                 {
                     "role": "system",
-                    "content":
-                        """
-                        You are an EXTREMELY STRICT, HIGH-PRECISION food parser.
-
-Your job is to convert natural language food descriptions into structured JSON with near-perfect consistency.
-
-You MUST return ONLY valid JSON. No explanations. No extra text.
-
------------------------------------
-OUTPUT FORMATS (ONLY TWO ALLOWED)
------------------------------------
-
-1. MULTIPLE SEPARATE FOODS:
-[
-  {"food": "egg", "quantity": 2},
-  {"food": "milk", "quantity": 1, "unit": "cup"}
-]
-
-2. SINGLE COMPOSED DISH:
-{
-  "dish": "chicken alfredo pasta with mushrooms and onions"
-}
-
------------------------------------
-CORE PRINCIPLE (VERY IMPORTANT)
------------------------------------
-
-WHEN IN DOUBT → RETURN A SINGLE DISH.
-
-It is ALWAYS better to group foods into ONE dish unless there is STRONG, EXPLICIT evidence they are separate.
-
------------------------------------
-AGGRESSIVE DECISION LOGIC
------------------------------------
-
-A. SINGLE DISH (DEFAULT BEHAVIOR)
-
-Return ONE "dish" object if the input describes a meal, plate, or foods likely eaten together.
-
-This includes:
-
-- "X with Y" → ALWAYS SINGLE DISH
-- "X and Y" → ASSUME SINGLE DISH unless clearly separate
-- Combo meals, plates, bowls, or typical pairings
-- Foods served together (main + sides)
-
------------------------------------
-
-B. MULTIPLE FOODS (ONLY WITH STRONG EVIDENCE)
-
-Return a LIST ONLY if there is CLEAR separation in time, intent, or phrasing.
-
-STRONG separation signals:
-
-- Time separation:
-  "later", "after", "then", "for dessert"
-- Explicit separation:
-  "separately", "on its own", "by itself"
-- Different actions:
-  "ate X and drank Y later"
-
------------------------------------
-CRITICAL EDGE CASE RULES
------------------------------------
-
-1. "AND" RULE
-- Default: SAME DISH
-- Only split if strong separation signals exist
-
-2. BREAKFAST / COMBO PLATES
-- Multiple foods listed together → SINGLE DISH
-
-3. DRINKS
-- Included in dish if part of meal
-- Separate ONLY if clearly consumed independently
-
-4. "WITH" RULE
-- ALWAYS SINGLE DISH
-
-5. "ON THE SIDE"
-- STILL SINGLE DISH unless explicitly consumed separately
-
------------------------------------
-PARSING RULES
------------------------------------
-
-1. QUANTITIES
-- Convert number words to integers
-- "a/an" → 1
-- Only apply to separate food items
-- NEVER assign quantity to "dish"
-
-2. UNITS
-- Extract only if explicitly stated
-- Keep lowercase and singular
-- Do NOT guess
-
-3. FOOD NORMALIZATION
-- Simplify names:
-  "scrambled eggs" → "egg"
-  "a glass of milk" → "milk"
-
-4. DISH PRESERVATION
-- Preserve full description
-- Do NOT split ingredients
-
-5. IGNORE FILLER TEXT
-- Ignore phrases like:
-  "I had", "for lunch", "today", etc.
-
------------------------------------
-FEW-SHOT EXAMPLES (CRITICAL)
------------------------------------
-
-Input: "2 eggs and 1 cup milk"
-Output:
-[
-  {"food": "egg", "quantity": 2},
-  {"food": "milk", "quantity": 1, "unit": "cup"}
-]
-
----
-
-Input: "chicken alfredo pasta with mushrooms and onions"
-Output:
-{
-  "dish": "chicken alfredo pasta with mushrooms and onions"
-}
-
----
-
-Input: "pasta and salad"
-Output:
-{
-  "dish": "pasta and salad"
-}
-
----
-
-Input: "eggs toast and bacon"
-Output:
-{
-  "dish": "eggs toast and bacon"
-}
-
----
-
-Input: "burger and fries with a drink"
-Output:
-{
-  "dish": "burger and fries with a drink"
-}
-
----
-
-Input: "I had pasta and later drank milk"
-Output:
-[
-  {"food": "pasta", "quantity": 1},
-  {"food": "milk", "quantity": 1}
-]
-
----
-
-Input: "coffee and a bagel"
-Output:
-{
-  "dish": "coffee and bagel"
-}
-
------------------------------------
-FINAL INSTRUCTION
------------------------------------
-
-Return ONLY valid JSON.
-NO explanations.
-NO extra text.
-NO formatting errors.
-                        """
+                    "content": """<KEEP YOUR EXISTING PROMPT EXACTLY AS IS>"""
                 },
                 {"role": "user", "content": prompt}
             ],
@@ -299,11 +153,11 @@ async def extract_foods_with_ai(query: str):
         data = extract_json(text)
         if data:
             return validate_foods(data)
-    # HARD fallback (safe)
+
     return [{"food": query, "quantity": 1}]
 
 
-# ------------------ SMART USDA FETCH ------------------
+# ------------------ USDA FETCH ------------------
 
 async def fetch_usda(food_name: str):
     async with httpx.AsyncClient() as http_client:
@@ -320,7 +174,6 @@ async def fetch_usda(food_name: str):
         if not foods:
             return None
 
-        # Score foods to select the most realistic one
         def score_food(food):
             desc = food.get("description", "").lower()
             score = 0
@@ -337,7 +190,6 @@ async def fetch_usda(food_name: str):
         foods_sorted = sorted(foods, key=score_food, reverse=True)
         selected_food = foods_sorted[0]
 
-        # Extract key nutrients
         nutrient_lookup = {
             "Energy": "calories",
             "Protein": "protein_g",
@@ -347,6 +199,7 @@ async def fetch_usda(food_name: str):
             "Fiber, total dietary": "fiber_g",
             "Vitamin D (D2 + D3)": "vitamin_d_mcg",
         }
+
         nutrition_data = {v: 0 for v in nutrient_lookup.values()}
 
         for nutrient in selected_food.get("foodNutrients", []):
@@ -354,24 +207,52 @@ async def fetch_usda(food_name: str):
             if name in nutrient_lookup:
                 nutrition_data[nutrient_lookup[name]] = nutrient.get("value", 0)
 
-        # ------------------ SERVING NORMALIZATION ------------------
+        # Serving normalization
         if "egg" in food_name.lower():
-            # USDA often returns per 100g; 1 egg ≈ 50g
             for k in nutrition_data:
                 nutrition_data[k] *= 0.5
         elif "milk" in food_name.lower():
-            # 1 cup ≈ 244g
             for k in nutrition_data:
                 nutrition_data[k] *= 2.44
 
         return nutrition_data
 
 
-# ------------------ MAIN ENDPOINT ------------------
+# ------------------ TEXT INPUT ENDPOINT ------------------
+
 @app.get("/foods/search", response_class=HTMLResponse)
 async def usda_api(request: Request, query: str):
     query = clean_voice_input(query)
     foods = await extract_foods_with_ai(query)
+
+    return await process_foods(request, foods)
+
+
+# ------------------ VOICE INPUT ENDPOINT ------------------
+
+@app.post("/voice")
+async def voice_input(request: Request, file: UploadFile = File(...)):
+
+    transcript = await transcribe_audio(file)
+
+    if not transcript:
+        return {"error": "Transcription failed"}
+
+    print("Raw transcript:", transcript)
+
+    cleaned_query = normalize_transcript(transcript)
+    cleaned_query = clean_voice_input(cleaned_query)
+
+    print("Cleaned:", cleaned_query)
+
+    foods = await extract_foods_with_ai(cleaned_query)
+
+    return await process_foods(request, foods, transcript=transcript)
+
+
+# ------------------ SHARED PROCESSOR ------------------
+
+async def process_foods(request, foods, transcript=None):
 
     results = []
     totals = {
@@ -385,17 +266,15 @@ async def usda_api(request: Request, query: str):
     }
 
     for food in foods:
-        nutrition = await fetch_usda(food["food"])
-        if not nutrition:
-            nutrition = {
-                "calories": 0,
-                "protein_g": 0,
-                "carbs_g": 0,
-                "fat_g": 0,
-                "sugar_g": 0,
-                "fiber_g": 0,
-                "vitamin_d_mcg": 0
-            }
+        nutrition = await fetch_usda(food["food"]) or {
+            "calories": 0,
+            "protein_g": 0,
+            "carbs_g": 0,
+            "fat_g": 0,
+            "sugar_g": 0,
+            "fiber_g": 0,
+            "vitamin_d_mcg": 0
+        }
 
         for k in nutrition:
             nutrition[k] *= food["quantity"]
@@ -426,6 +305,7 @@ async def usda_api(request: Request, query: str):
         {
             "request": request,
             "results": results,
-            "totals": totals
+            "totals": totals,
+            "transcript": transcript
         }
     )
