@@ -10,7 +10,6 @@ from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from supabase_client import supabase
 from tavily import TavilyClient
 from openai import OpenAI
 
@@ -40,124 +39,10 @@ stt_client = OpenAI(
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 templates = Jinja2Templates(directory="templates")
 
-# ------------------ ROUTE ------------------
+# ------------------ FOOD PARSER PROMPT ------------------
 
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    return templates.TemplateResponse("front_end.html", {"request": request})
-
-# ------------------ CLEAN INPUT ------------------
-
-def clean_voice_input(query: str):
-    query = query.lower()
-    fillers = [
-        "i ate", "i had", "i just ate",
-        "for breakfast", "for lunch", "for dinner"
-    ]
-    for f in fillers:
-        query = query.replace(f, "")
-    return query.strip()
-
-def normalize_transcript(text: str):
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    return text.strip()
-
-# ------------------ WHISPER STT ------------------
-
-async def transcribe_audio(file):
-    try:
-        audio_bytes = await file.read()
-        response = stt_client.audio.transcriptions.create(
-            file=("audio.wav", audio_bytes),
-            model="whisper-large-v3-turbo"
-        )
-        return response.text
-    except Exception as e:
-        print("Whisper error:", e)
-        return None
-
-# ------------------ SAFE GROQ CALL ------------------
-
-def safe_groq_call(prompt: str):
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Return ONLY valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=500
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print("Groq error:", e)
-        return None
-
-# ------------------ JSON EXTRACTION ------------------
-
-def extract_json(text):
-    try:
-        return json.loads(text)
-    except Exception as e:
-        print("JSON parse error:", e)
-        return None
-
-# ------------------ VALIDATE FOODS ------------------
-
-def validate_foods(data):
-    VALID_STOPWORDS = {"and", "of", "a", "the"}
-    clean = []
-    for item in data:
-        food = item.get("food", "").strip()
-        if not food or food in VALID_STOPWORDS:
-            continue
-        quantity = item.get("quantity", 1)
-        try:
-            quantity = float(quantity)
-        except:
-            quantity = 1
-        clean.append({
-            "food": food,
-            "quantity": quantity
-        })
-    return clean
-
-# ------------------ DISH DECOMPOSITION ------------------
-
-def decompose_dish_to_ingredients(dish_name: str):
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": """<Your full strict food parser system prompt here>"""
-                },
-                {"role": "user", "content": dish_name}
-            ],
-            temperature=0
-        )
-        text = response.choices[0].message.content
-        data = json.loads(text)
-        if isinstance(data, list):
-            return data
-    except Exception as e:
-        print("Decomposition error:", e)
-    return [dish_name]
-
-# ------------------ PORTION ESTIMATION ------------------
-
-def estimate_portion(food_text: str):
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-                    You are an EXTREMELY STRICT, HIGH-PRECISION food parser.
+FOOD_PARSER_PROMPT = """
+You are an EXTREMELY STRICT, HIGH-PRECISION food parser.
 
 Your job is to convert natural language food descriptions into structured JSON with near-perfect consistency.
 
@@ -334,115 +219,235 @@ NO explanations.
 NO extra text.
 NO formatting errors.
 """
-                },
-                {"role": "user", "content": food_text}
-            ],
-            temperature=0
-        )
-        text = response.choices[0].message.content
-        data = json.loads(text)
-        if "quantity" in data:
-            return float(data["quantity"])
-    except Exception as e:
-        print("Portion estimation error:", e)
-    return 1
 
-# ------------------ AI FOOD EXTRACTION ------------------
+# ------------------ ROUTES ------------------
 
-async def extract_foods_with_ai(query: str):
-    prompt = f'Extract foods from: "{query}"'
-    text = safe_groq_call(prompt)
-    if text:
-        data = extract_json(text)
-        if data:
-            # CASE 1: multiple foods
-            if isinstance(data, list):
-                validated = validate_foods(data)
-                for item in validated:
-                    item["quantity"] *= estimate_portion(item["food"])
-                return validated
-            # CASE 2: dish → decompose
-            elif isinstance(data, dict) and "dish" in data:
-                ingredients = decompose_dish_to_ingredients(data["dish"])
-                portion = estimate_portion(data["dish"])
-                return [
-                    {"food": ingredient, "quantity": portion}
-                    for ingredient in ingredients
-                ]
-    return [{"food": query, "quantity": 1}]
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("front_end.html", {"request": request})
 
-# ------------------ USDA FETCH ------------------
-
-async def fetch_usda(food_name: str):
-    async with httpx.AsyncClient() as http_client:
-        response = await http_client.post(
-            "https://api.nal.usda.gov/fdc/v1/foods/search",
-            params={"api_key": USDA_API_KEY},
-            json={"query": food_name}
-        )
-        if response.status_code != 200:
-            return None
-        foods = response.json().get("foods", [])
-        if not foods:
-            return None
-
-        def score_food(food):
-            desc = food.get("description", "").lower()
-            score = 0
-            if "raw" in desc:
-                score += 5
-            if "large" in desc:
-                score += 3
-            bad_words = ["dried", "powder", "mix", "substitute", "liquid"]
-            for word in bad_words:
-                if word in desc:
-                    score -= 10
-            return score
-
-        foods_sorted = sorted(foods, key=score_food, reverse=True)
-        selected_food = foods_sorted[0]
-
-        nutrient_lookup = {
-            "Energy": "calories",
-            "Protein": "protein_g",
-            "Carbohydrate, by difference": "carbs_g",
-            "Total lipid (fat)": "fat_g",
-            "Total Sugars including NLEA": "sugar_g",
-            "Fiber, total dietary": "fiber_g",
-            "Vitamin D (D2 + D3)": "vitamin_d_mcg",
-        }
-
-        nutrition_data = {v: 0 for v in nutrient_lookup.values()}
-
-        for nutrient in selected_food.get("foodNutrients", []):
-            name = nutrient.get("nutrientName")
-            if name in nutrient_lookup:
-                nutrition_data[nutrient_lookup[name]] = nutrient.get("value", 0)
-
-        return nutrition_data
-
-# ------------------ TEXT INPUT ------------------
-
+# TEXT INPUT ROUTE
 @app.get("/foods/search", response_class=HTMLResponse)
 async def usda_api(request: Request, query: str):
     query = clean_voice_input(query)
     foods = await extract_foods_with_ai(query)
     return await process_foods(request, foods)
 
-# ------------------ VOICE INPUT ------------------
-
+# VOICE INPUT ROUTE
 @app.post("/voice")
 async def voice_input(request: Request, file: UploadFile = File(...)):
     transcript = await transcribe_audio(file)
     if not transcript:
         return {"error": "Transcription failed"}
-
     cleaned_query = normalize_transcript(transcript)
     cleaned_query = clean_voice_input(cleaned_query)
     foods = await extract_foods_with_ai(cleaned_query)
     return await process_foods(request, foods, transcript=transcript)
 
-# ------------------ PROCESS FOODS ------------------
+# ------------------ CLEAN INPUT ------------------
+
+def clean_voice_input(query: str):
+    query = query.lower()
+    fillers = ["i ate", "i had", "i just ate", "for breakfast", "for lunch", "for dinner"]
+    for f in fillers:
+        query = query.replace(f, "")
+    return query.strip()
+
+def normalize_transcript(text: str):
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    return text.strip()
+
+# ------------------ WHISPER ------------------
+
+async def transcribe_audio(file):
+    try:
+        audio_bytes = await file.read()
+        response = stt_client.audio.transcriptions.create(
+            file=("audio.wav", audio_bytes),
+            model="whisper-large-v3-turbo"
+        )
+        return response.text
+    except Exception as e:
+        print("Whisper error:", e)
+        return None
+
+# ------------------ SAFE GROQ CALL ------------------
+
+def safe_groq_call(user_prompt: str, system_prompt: str = "Return ONLY valid JSON."):
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0,
+            max_tokens=500
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print("Groq error:", e)
+        return None
+
+# ------------------ JSON ------------------
+
+def extract_json(text):
+    try:
+        return json.loads(text)
+    except Exception as e:
+        print("JSON parse error:", e)
+        return None
+
+# ------------------ VALIDATE ------------------
+
+def validate_foods(data):
+    VALID_STOPWORDS = {"and", "of", "a", "the"}
+    clean = []
+    for item in data:
+        food = item.get("food", "").strip()
+        if not food or food in VALID_STOPWORDS:
+            continue
+        try:
+            quantity = float(item.get("quantity", 1))
+        except:
+            quantity = 1
+        clean.append({"food": food, "quantity": quantity})
+    return clean
+
+# ------------------ DECOMPOSE ------------------
+
+def decompose_dish_to_ingredients(dish_name: str):
+    try:
+        text = safe_groq_call(dish_name, "Return a JSON array of core ingredients only.")
+        data = extract_json(text)
+        if isinstance(data, list):
+            return data
+    except Exception as e:
+        print("Decomposition error:", e)
+    return [dish_name]
+
+# ------------------ PORTION ------------------
+
+def estimate_portion(food_text: str):
+    try:
+        text = safe_groq_call(food_text, """
+Return ONLY JSON: {"quantity": number}
+
+Rules:
+- one=1, two=2, three=3
+- a/an=1
+- bowl=2, plate=2
+- slice=1, cup=1, glass=1
+
+Examples:
+"one bowl pasta" → 2
+"two bowls pasta" → 4
+
+If unclear → 1
+""")
+        data = extract_json(text)
+        return float(data.get("quantity", 1))
+    except Exception as e:
+        print("Portion error:", e)
+        return 1
+
+# ------------------ AI EXTRACTION ------------------
+
+async def extract_foods_with_ai(query: str):
+    # Ask Groq AI to parse the foods using our strict prompt
+    text = safe_groq_call(query, FOOD_PARSER_PROMPT)
+
+    if text:
+        data = extract_json(text)
+
+        if data:
+            # AI returned a list → treat as separate foods
+            if isinstance(data, list):
+                validated = validate_foods(data)
+                portion = estimate_portion(query)
+                for item in validated:
+                    item["quantity"] *= portion
+                return validated
+
+            # AI returned a single dish → do NOT decompose, treat as 1 item
+            elif isinstance(data, dict) and "dish" in data:
+                portion = estimate_portion(query)
+                return [{"food": data["dish"], "quantity": portion}]
+
+    # Fallback → treat input as a single food
+    return [{"food": query, "quantity": 1}]
+
+# ------------------ PORTION ------------------
+
+def estimate_portion(food_text: str):
+    """
+    Estimates quantity based on text like:
+    "one bowl pasta" → 1
+    "two bowls pasta" → 2
+    Defaults to 1 if unclear.
+    """
+    try:
+        text = safe_groq_call(food_text, """
+Return ONLY JSON: {"quantity": number}
+
+Rules:
+- one=1, two=2, three=3
+- a/an=1
+- bowl=1, plate=1   # <-- changed from 2 to 1
+- slice=1, cup=1, glass=1
+
+Examples:
+"one bowl pasta" → 1
+"two bowls pasta" → 2
+
+If unclear → 1
+""")
+        data = extract_json(text)
+        return float(data.get("quantity", 1))
+    except Exception as e:
+        print("Portion error:", e)
+        return 1
+
+# ------------------ USDA ------------------
+async def fetch_usda(food_name: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.nal.usda.gov/fdc/v1/foods/search",
+            params={"api_key": USDA_API_KEY},
+            json={"query": food_name}
+        )
+
+        if response.status_code != 200:
+            return None
+
+        foods = response.json().get("foods", [])
+        if not foods:
+            return None
+
+        selected = foods[0]
+
+        # Define all macros we want
+        lookup = {
+            "Energy": "calories",
+            "Protein": "protein_g",
+            "Carbohydrate, by difference": "carbs_g",
+            "Total lipid (fat)": "fat_g",
+            "Sugars, total including NLEA": "sugar_g",
+            "Fiber, total dietary": "fiber_g",
+            "Vitamin D (D2 + D3), International Units": "vitamin_d_mcg"
+        }
+
+        # Initialize with "Not Available"
+        nutrition = {v: "Not Available" for v in lookup.values()}
+
+        for n in selected.get("foodNutrients", []):
+            if n.get("nutrientName") in lookup:
+                nutrition[lookup[n["nutrientName"]]] = n.get("value", "Not Available")
+
+        return nutrition
+
+# ------------------ PROCESS ------------------
 
 async def process_foods(request, foods, transcript=None):
     results = []
@@ -457,41 +462,29 @@ async def process_foods(request, foods, transcript=None):
     }
 
     for food in foods:
-        nutrition = await fetch_usda(food["food"])
-        if not nutrition:
-            print(f"USDA failed for: {food['food']}")
-            nutrition = {k: 0 for k in totals}
+        nutrition = await fetch_usda(food["food"]) or {k: "Not Available" for k in totals}
 
+        # Multiply numeric values by quantity
         for k in nutrition:
-            nutrition[k] *= food["quantity"]
+            if isinstance(nutrition[k], (int, float)):
+                nutrition[k] *= food["quantity"]
+            else:
+                nutrition[k] = "Not Available"
 
-        result = {
-            "food": f"{food['quantity']} x {food['food']}",
-            **nutrition
-        }
-
+        result = {"food": f"{food['quantity']} x {food['food']}", **nutrition}
         results.append(result)
 
+        # Add to totals if numeric
         for key in totals:
-            totals[key] += result.get(key, 0)
+            if isinstance(nutrition[key], (int, float)):
+                totals[key] += nutrition[key]
 
-        try:
-            supabase.table("food_searches").insert({
-                "food_name": result["food"],
-                "calories": result["calories"],
-                "protein": result["protein_g"],
-                "carbs": result["carbs_g"],
-                "fat": result["fat_g"]
-            }).execute()
-        except Exception as e:
-            print("Supabase insert failed:", e)
+    # Convert totals for missing values
+    for key in totals:
+        if totals[key] == 0:
+            totals[key] = "Not Available"
 
     return templates.TemplateResponse(
         "front_end.html",
-        {
-            "request": request,
-            "results": results,
-            "totals": totals,
-            "transcript": transcript
-        }
+        {"request": request, "results": results, "totals": totals, "transcript": transcript}
     )
