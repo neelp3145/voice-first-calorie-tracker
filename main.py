@@ -226,22 +226,21 @@ NO formatting errors.
 async def home(request: Request):
     return templates.TemplateResponse("front_end.html", {"request": request})
 
-# TEXT INPUT ROUTE
 @app.get("/foods/search", response_class=HTMLResponse)
 async def usda_api(request: Request, query: str):
     query = clean_voice_input(query)
     foods = await extract_foods_with_ai(query)
     return await process_foods(request, foods)
 
-# VOICE INPUT ROUTE
 @app.post("/voice")
 async def voice_input(request: Request, file: UploadFile = File(...)):
     transcript = await transcribe_audio(file)
     if not transcript:
         return {"error": "Transcription failed"}
-    cleaned_query = normalize_transcript(transcript)
-    cleaned_query = clean_voice_input(cleaned_query)
+
+    cleaned_query = clean_voice_input(normalize_transcript(transcript))
     foods = await extract_foods_with_ai(cleaned_query)
+
     return await process_foods(request, foods, transcript=transcript)
 
 # ------------------ CLEAN INPUT ------------------
@@ -254,9 +253,7 @@ def clean_voice_input(query: str):
     return query.strip()
 
 def normalize_transcript(text: str):
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    return text.strip()
+    return re.sub(r"[^\w\s]", "", text.lower()).strip()
 
 # ------------------ WHISPER ------------------
 
@@ -272,9 +269,9 @@ async def transcribe_audio(file):
         print("Whisper error:", e)
         return None
 
-# ------------------ SAFE GROQ CALL ------------------
+# ------------------ GROQ ------------------
 
-def safe_groq_call(user_prompt: str, system_prompt: str = "Return ONLY valid JSON."):
+def safe_groq_call(user_prompt: str, system_prompt: str):
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -283,7 +280,7 @@ def safe_groq_call(user_prompt: str, system_prompt: str = "Return ONLY valid JSO
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0,
-            max_tokens=500
+            max_tokens=300
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -295,135 +292,56 @@ def safe_groq_call(user_prompt: str, system_prompt: str = "Return ONLY valid JSO
 def extract_json(text):
     try:
         return json.loads(text)
-    except Exception as e:
-        print("JSON parse error:", e)
+    except:
         return None
 
 # ------------------ VALIDATE ------------------
 
 def validate_foods(data):
-    VALID_STOPWORDS = {"and", "of", "a", "the"}
     clean = []
     for item in data:
-        food = item.get("food", "").strip()
-        if not food or food in VALID_STOPWORDS:
-            continue
         try:
-            quantity = float(item.get("quantity", 1))
+            clean.append({
+                "food": item["food"],
+                "quantity": float(item.get("quantity", 1))
+            })
         except:
-            quantity = 1
-        clean.append({"food": food, "quantity": quantity})
+            continue
     return clean
-
-# ------------------ DECOMPOSE ------------------
-
-def decompose_dish_to_ingredients(dish_name: str):
-    try:
-        text = safe_groq_call(dish_name, "Return a JSON array of core ingredients only.")
-        data = extract_json(text)
-        if isinstance(data, list):
-            return data
-    except Exception as e:
-        print("Decomposition error:", e)
-    return [dish_name]
 
 # ------------------ PORTION ------------------
 
-def estimate_portion(food_text: str):
+def estimate_portion(text: str):
     try:
-        text = safe_groq_call(food_text, """
-Return ONLY JSON: {"quantity": number}
-
-Rules:
-- one=1, two=2, three=3
-- a/an=1
-- bowl=2, plate=2
-- slice=1, cup=1, glass=1
-
-Examples:
-"one bowl pasta" → 2
-"two bowls pasta" → 4
-
-If unclear → 1
+        result = safe_groq_call(text, """
+Return ONLY JSON: {"quantity": number} Rules: 1. NUMBER WORDS - one → 1, two → 2, three → 3, four → 4, five → 5 - a/an → 1 - half → 0.5, quarter → 0.25 - If a decimal is written (e.g., 1.5) → use it directly 2. UNITS - bowl, plate, cup, glass, slice → do NOT multiply; unit only helps clarify - Ignore words like 'serving', 'piece', 'portion' unless numeric 3. DEFAULT - If no number found → 1 - Fractions or mixed numbers should be handled correctly EXAMPLES: - "one bowl pasta" → 1 - "two bowls pasta" → 2 - "half cup rice" → 0.5 - "1.5 slices bread" → 1.5 - "a plate of chicken" → 1 Return JSON only, nothing else.
 """)
-        data = extract_json(text)
+        data = extract_json(result)
         return float(data.get("quantity", 1))
-    except Exception as e:
-        print("Portion error:", e)
+    except:
         return 1
 
 # ------------------ AI EXTRACTION ------------------
 
 async def extract_foods_with_ai(query: str):
-    # Ask Groq AI to parse the foods using our strict prompt
     text = safe_groq_call(query, FOOD_PARSER_PROMPT)
 
     if text:
         data = extract_json(text)
 
-        if data:
-            # AI returned a list → treat as separate foods
-            if isinstance(data, list):
-                validated = validate_foods(data)
-                portion = estimate_portion(query)
-                for item in validated:
-                    item["quantity"] *= portion
-                return validated
+        if isinstance(data, list):
+            return validate_foods(data)
 
-            # AI returned a single dish → do NOT decompose, treat as 1 item
-            elif isinstance(data, dict) and "dish" in data:
-                portion = estimate_portion(query)
-                return [{"food": data["dish"], "quantity": portion}]
+        elif isinstance(data, dict) and "dish" in data:
+            return [{
+                "food": data["dish"],
+                "quantity": estimate_portion(query)
+            }]
 
-    # Fallback → treat input as a single food
     return [{"food": query, "quantity": 1}]
 
-# ------------------ PORTION ------------------
-
-def estimate_portion(food_text: str):
-    """
-    Estimates quantity based on text like:
-    - "one bowl pasta" → 1
-    - "two bowls pasta" → 2
-    - "half cup rice" → 0.5
-    - "1.5 slices bread" → 1.5
-    Defaults to 1 if unclear.
-    """
-    try:
-        text = safe_groq_call(food_text, """
-Return ONLY JSON: {"quantity": number}
-
-Rules:
-1. NUMBER WORDS
-- one → 1, two → 2, three → 3, four → 4, five → 5
-- a/an → 1
-- half → 0.5, quarter → 0.25
-- If a decimal is written (e.g., 1.5) → use it directly
-
-2. UNITS
-- bowl, plate, cup, glass, slice → do NOT multiply; unit only helps clarify
-- Ignore words like 'serving', 'piece', 'portion' unless numeric
-
-3. DEFAULT
-- If no number found → 1
-- Fractions or mixed numbers should be handled correctly
-
-EXAMPLES:
-- "one bowl pasta" → 1
-- "two bowls pasta" → 2
-- "half cup rice" → 0.5
-- "1.5 slices bread" → 1.5
-- "a plate of chicken" → 1
-
-Return JSON only, nothing else.
-""")
-        data = extract_json(text)
-        return float(data.get("quantity", 1))
-    except Exception as e:
-        print("Portion error:", e)
-        return 1
-
 # ------------------ USDA ------------------
+
 async def fetch_usda(food_name: str):
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -441,7 +359,6 @@ async def fetch_usda(food_name: str):
 
         selected = foods[0]
 
-        # Define all macros we want
         lookup = {
             "Energy": "calories",
             "Protein": "protein_g",
@@ -452,7 +369,6 @@ async def fetch_usda(food_name: str):
             "Vitamin D (D2 + D3), International Units": "vitamin_d_mcg"
         }
 
-        # Initialize with "Not Available"
         nutrition = {v: "Not Available" for v in lookup.values()}
 
         for n in selected.get("foodNutrients", []):
@@ -475,30 +391,37 @@ async def process_foods(request, foods, transcript=None):
         "vitamin_d_mcg": 0
     }
 
+    totals_available = {k: False for k in totals}
+
     for food in foods:
         nutrition = await fetch_usda(food["food"]) or {k: "Not Available" for k in totals}
 
-        # Multiply numeric values by quantity
         for k in nutrition:
             if isinstance(nutrition[k], (int, float)):
                 nutrition[k] *= food["quantity"]
+                totals_available[k] = True
             else:
                 nutrition[k] = "Not Available"
 
-        result = {"food": f"{food['quantity']} x {food['food']}", **nutrition}
-        results.append(result)
+        results.append({
+            "food": f"{food['quantity']} x {food['food']}",
+            **nutrition
+        })
 
-        # Add to totals if numeric
-        for key in totals:
-            if isinstance(nutrition[key], (int, float)):
-                totals[key] += nutrition[key]
+        for k in totals:
+            if isinstance(nutrition[k], (int, float)):
+                totals[k] += nutrition[k]
 
-    # Convert totals for missing values
-    for key in totals:
-        if totals[key] == 0:
-            totals[key] = "Not Available"
+    for k in totals:
+        if not totals_available[k]:
+            totals[k] = "Not Available"
 
     return templates.TemplateResponse(
         "front_end.html",
-        {"request": request, "results": results, "totals": totals, "transcript": transcript}
+        {
+            "request": request,
+            "results": results,
+            "totals": totals,
+            "transcript": transcript
+        }
     )
