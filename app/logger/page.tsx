@@ -297,10 +297,6 @@ export default function LoggerPage() {
                     </p>
                   </div>
                   <div className="text-right">
-                    <p className="text-sm text-white/60">Confidence</p>
-                    <p className="mt-2 text-lg font-medium text-white/90">
-                      94%
-                    </p>
                   </div>
                 </div>
 
@@ -324,9 +320,7 @@ export default function LoggerPage() {
                   Detected foods
                 </p>
                 <div className="mt-4 flex flex-wrap gap-3">
-                  <FoodPill label="Grilled chicken breast" />
-                  <FoodPill label="White rice" />
-                  <FoodPill label="Protein shake" />
+                {foods.map((food, i) => ( <FoodPill key={i} label={food} /> ))}
                 </div>
               </div>
 
