@@ -2,7 +2,10 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+
+import { ensureAuthenticatedOrRedirect } from "../../lib/auth";
+import { getAccessToken } from "../../lib/supabase";
 
 type NutritionTotals = {
   calories: number | string;
@@ -30,6 +33,45 @@ type VoiceResponse = SearchResponse & {
   transcript: string;
 };
 
+type BrowserSpeechRecognitionResultEvent = {
+  results: ArrayLike<ArrayLike<{ transcript: string }>>;
+};
+
+type BrowserSpeechRecognitionErrorEvent = {
+  error: string;
+};
+
+type BrowserSpeechRecognition = {
+  lang: string;
+  interimResults: boolean;
+  continuous: boolean;
+  start: () => void;
+  onresult: ((event: BrowserSpeechRecognitionResultEvent) => void) | null;
+  onerror: ((event: BrowserSpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+};
+
+type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return fallback;
+}
+
+function parseLoggedFoodLabel(label: string): { quantity: number; foodName: string } {
+  const match = label.trim().match(/^(\d+(?:\.\d+)?)\s*x\s+(.+)$/i);
+  if (!match) {
+    return { quantity: 1, foodName: label.trim() };
+  }
+
+  return {
+    quantity: Number.parseFloat(match[1]) || 1,
+    foodName: match[2].trim(),
+  };
+}
+
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
@@ -39,16 +81,33 @@ export default function LoggerPage() {
   const [transcript, setTranscript] = useState("");
   const [apiData, setApiData] = useState<SearchResponse | null>(null);
   const [error, setError] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
+  const [isLogging, setIsLogging] = useState(false);
   const [selectedFood, setSelectedFood] = useState<SearchResultItem | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+
+  useEffect(() => {
+    ensureAuthenticatedOrRedirect();
+  }, []);
 
   const supportsSpeechRecognition =
     typeof window !== "undefined" &&
     ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
 
   const fetchByQuery = async (queryText: string) => {
+    const accessToken = await getAccessToken();
+
+    if (!accessToken) {
+      throw new Error("You must sign in before logging meals.");
+    }
+
     const response = await fetch(
-      `${API_BASE_URL}/api/foods/search?query=${encodeURIComponent(queryText)}`
+      `${API_BASE_URL}/api/foods/search?query=${encodeURIComponent(queryText)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
     );
 
     if (!response.ok) {
@@ -57,15 +116,25 @@ export default function LoggerPage() {
 
     const data: SearchResponse = await response.json();
     setApiData(data);
+    setStatusMessage("");
   };
 
   const uploadRecordedAudio = async (blob: Blob) => {
+    const accessToken = await getAccessToken();
+
+    if (!accessToken) {
+      throw new Error("You must sign in before logging meals.");
+    }
+
     const formData = new FormData();
     const extension = blob.type.includes("ogg") ? "ogg" : "webm";
     formData.append("file", blob, `meal.${extension}`);
 
     const response = await fetch(`${API_BASE_URL}/api/voice`, {
       method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
       body: formData,
     });
 
@@ -76,6 +145,7 @@ export default function LoggerPage() {
     const data: VoiceResponse = await response.json();
     setTranscript(data.transcript || "");
     setApiData({ query: data.query, results: data.results, totals: data.totals });
+    setStatusMessage("");
   };
 
   const startMediaRecorderFallback = async () => {
@@ -121,8 +191,8 @@ export default function LoggerPage() {
             type: recorder.mimeType || "audio/webm",
           });
           await uploadRecordedAudio(recordedBlob);
-        } catch (requestError: any) {
-          setError(requestError.message ?? "Failed to transcribe audio.");
+        } catch (requestError: unknown) {
+          setError(getErrorMessage(requestError, "Failed to transcribe audio."));
         } finally {
           setIsProcessing(false);
           mediaRecorderRef.current = null;
@@ -147,8 +217,13 @@ export default function LoggerPage() {
       return;
     }
 
+    const speechWindow = window as Window & {
+      SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+      webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
+    };
+
     const SpeechRecognitionConstructor =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
 
     if (!SpeechRecognitionConstructor) {
       await startMediaRecorderFallback();
@@ -164,12 +239,12 @@ export default function LoggerPage() {
 
     let finalTranscript = "";
 
-    recognition.onresult = (event: any) => {
+    recognition.onresult = (event: BrowserSpeechRecognitionResultEvent) => {
       finalTranscript = event.results[0][0].transcript;
       setTranscript(finalTranscript);
     };
 
-    recognition.onerror = (event: any) => {
+    recognition.onerror = (event: BrowserSpeechRecognitionErrorEvent) => {
       setError(`Speech error: ${event.error}`);
       setIsListening(false);
     };
@@ -184,8 +259,8 @@ export default function LoggerPage() {
       setIsProcessing(true);
       try {
         await fetchByQuery(finalTranscript);
-      } catch (requestError: any) {
-        setError(requestError.message ?? "Failed to fetch nutrition data.");
+      } catch (requestError: unknown) {
+        setError(getErrorMessage(requestError, "Failed to fetch nutrition data."));
       } finally {
         setIsProcessing(false);
       }
@@ -210,6 +285,58 @@ export default function LoggerPage() {
   const fats = apiData ? formatValue(apiData.totals.fat_g, "g") : "--";
 
   const closeFoodPopup = () => setSelectedFood(null);
+
+  const handleConfirmLog = async () => {
+    if (!apiData || apiData.results.length === 0 || isLogging) {
+      return;
+    }
+
+    setError("");
+    setStatusMessage("");
+    setIsLogging(true);
+
+    try {
+      const accessToken = await getAccessToken();
+      if (!accessToken) {
+        throw new Error("You must sign in before logging meals.");
+      }
+
+      for (const item of apiData.results) {
+        const parsed = parseLoggedFoodLabel(item.food);
+        const calories = typeof item.calories === "number" ? item.calories : 0;
+        const protein = typeof item.protein_g === "number" ? item.protein_g : 0;
+        const carbs = typeof item.carbs_g === "number" ? item.carbs_g : 0;
+        const fat = typeof item.fat_g === "number" ? item.fat_g : 0;
+
+        const response = await fetch(`${API_BASE_URL}/api/journal/entries`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            food_name: parsed.foodName,
+            quantity: parsed.quantity,
+            calories,
+            protein_g: protein,
+            carbs_g: carbs,
+            fat_g: fat,
+          }),
+        });
+
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail ?? `Failed to log meal (${response.status})`);
+        }
+      }
+
+      setStatusMessage("Meal logged to your journal.");
+    } catch (loggingError: unknown) {
+      setError(getErrorMessage(loggingError, "Failed to log meal."));
+    } finally {
+      setIsLogging(false);
+    }
+  };
 
   return (
     <main className="relative min-h-screen overflow-x-hidden bg-gradient-to-b from-[#0b1220] via-[#0b1220] to-[#07121a] text-white">
@@ -333,6 +460,10 @@ export default function LoggerPage() {
             <div className="mt-8 text-center">
               {error && (
                 <p className="mb-4 text-sm font-medium text-red-300">{error}</p>
+              )}
+
+              {statusMessage && (
+                <p className="mb-4 text-sm font-medium text-emerald-300">{statusMessage}</p>
               )}
 
               {!supportsSpeechRecognition && (
@@ -490,8 +621,12 @@ export default function LoggerPage() {
                 <button className="flex-1 rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold text-white ring-1 ring-white/15 transition hover:bg-white/15">
                   Edit meal
                 </button>
-                <button className="flex-1 rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-semibold text-[#08131a] transition hover:bg-emerald-400">
-                  Confirm & Log
+                <button
+                  onClick={handleConfirmLog}
+                  disabled={!apiData || apiData.results.length === 0 || isLogging}
+                  className="flex-1 rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-semibold text-[#08131a] transition hover:bg-emerald-400 disabled:opacity-60"
+                >
+                  {isLogging ? "Logging..." : "Confirm & Log"}
                 </button>
               </div>
             </div>

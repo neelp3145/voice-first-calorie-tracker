@@ -5,16 +5,57 @@ import os
 import httpx
 import json
 import re
+import logging
+import time
+from collections import defaultdict
+from threading import Lock
 
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
 from tavily import TavilyClient
 from openai import OpenAI
+from supabase_client import supabase_admin
 
 app = FastAPI()
+logger = logging.getLogger("vocalorie.api")
+logging.basicConfig(level=logging.INFO)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+MAX_QUERY_LENGTH = 200
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
+ALLOWED_AUDIO_TYPES = {
+    "audio/webm",
+    "audio/ogg",
+    "audio/wav",
+    "audio/mpeg",
+    "audio/mp4",
+}
+
+RATE_LIMIT_BUCKETS = defaultdict(list)
+RATE_LIMIT_LOCK = Lock()
+
+
+def validate_environment() -> None:
+    required = [
+        "USDA_API_KEY",
+        "GROQ_API_KEY",
+        "SUPABASE_URL",
+        "SUPABASE_ANON_KEY",
+    ]
+    missing = [name for name in required if not os.getenv(name)]
+
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    if not supabase_url.startswith("https://"):
+        raise RuntimeError("SUPABASE_URL must start with https://")
 
 allowed_origins = [
     origin.strip()
@@ -28,19 +69,35 @@ allowed_origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "microphone=(self), camera=(), geolocation=()"
+
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+
+    return response
+
 # ------------------ API KEYS ------------------
+
+validate_environment()
 
 USDA_API_KEY = os.getenv("USDA_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-
-if not USDA_API_KEY:
-    raise RuntimeError("USDA_API_KEY not set")
 
 # ------------------ CLIENTS ------------------
 
@@ -56,6 +113,177 @@ stt_client = OpenAI(
 
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 templates = Jinja2Templates(directory="templates")
+
+
+class ProfileUpdateRequest(BaseModel):
+    full_name: str | None = Field(default=None, max_length=120)
+    daily_calorie_goal: int | None = Field(default=None, ge=100, le=10000)
+    protein_goal_g: int | None = Field(default=None, ge=0, le=1000)
+    carb_goal_g: int | None = Field(default=None, ge=0, le=2000)
+    fat_goal_g: int | None = Field(default=None, ge=0, le=1000)
+
+    model_config = {"extra": "forbid"}
+
+
+class JournalEntryCreateRequest(BaseModel):
+    food_name: str = Field(min_length=1, max_length=200)
+    quantity: float = Field(default=1, gt=0, le=100)
+    calories: float | None = Field(default=None, ge=0, le=5000)
+    protein_g: float | None = Field(default=None, ge=0, le=1000)
+    carbs_g: float | None = Field(default=None, ge=0, le=1000)
+    fat_g: float | None = Field(default=None, ge=0, le=1000)
+
+    model_config = {"extra": "forbid"}
+
+
+class JournalEntryUpdateRequest(BaseModel):
+    food_name: str | None = Field(default=None, min_length=1, max_length=200)
+    quantity: float | None = Field(default=None, gt=0, le=100)
+    calories: float | None = Field(default=None, ge=0, le=5000)
+    protein_g: float | None = Field(default=None, ge=0, le=1000)
+    carbs_g: float | None = Field(default=None, ge=0, le=1000)
+    fat_g: float | None = Field(default=None, ge=0, le=1000)
+
+    model_config = {"extra": "forbid"}
+
+
+def get_admin_supabase_or_503():
+    if not supabase_admin:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database admin client is not configured.",
+        )
+
+    return supabase_admin
+
+
+def _is_missing_table_error(exc: Exception) -> bool:
+    lower_message = str(exc).lower()
+    return (
+        "pgrst205" in lower_message
+        or "could not find the table" in lower_message
+        or ("relation" in lower_message and "does not exist" in lower_message)
+    )
+
+
+def _translate_supabase_error(exc: Exception) -> HTTPException:
+    message = str(exc)
+    lower_message = message.lower()
+
+    if "relation" in lower_message and "does not exist" in lower_message:
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database schema is not initialized. Apply supabase/migrations/20260411_initial_security_schema.sql.",
+        )
+
+    if "invalid api key" in lower_message or "apikey" in lower_message:
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Supabase admin key is invalid for backend persistence. Set SUPABASE_SERVICE_ROLE_KEY to the real service role key.",
+        )
+
+    if "permission denied" in lower_message or "row-level security" in lower_message:
+        return HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Database denied access. Verify RLS policies and ensure backend uses the correct service role key.",
+        )
+
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"Supabase persistence error: {message}",
+    )
+
+
+def apply_rate_limit(identifier: str, route_key: str, limit: int, window_seconds: int):
+    now = time.time()
+    bucket_key = f"{route_key}:{identifier}"
+
+    with RATE_LIMIT_LOCK:
+        timestamps = RATE_LIMIT_BUCKETS[bucket_key]
+        RATE_LIMIT_BUCKETS[bucket_key] = [
+            ts for ts in timestamps if now - ts < window_seconds
+        ]
+        timestamps = RATE_LIMIT_BUCKETS[bucket_key]
+
+        if len(timestamps) >= limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many requests. Try again later.",
+            )
+
+        timestamps.append(now)
+
+
+def validate_query(query: str) -> str:
+    if not query or not query.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Query is required.",
+        )
+
+    cleaned = query.strip()
+    if len(cleaned) > MAX_QUERY_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Query too long. Max {MAX_QUERY_LENGTH} characters.",
+        )
+
+    return cleaned
+
+
+async def get_current_user(authorization: str = Header(default="")) -> dict:
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is not configured.",
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token.",
+        )
+
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid bearer token.",
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON_KEY,
+                },
+            )
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired session.",
+            )
+
+        data = response.json()
+        user_id = data.get("id")
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid session payload.",
+            )
+
+        return data
+    except HTTPException:
+        raise
+    except Exception:
+        logger.warning("Auth verification failed")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication failed.",
+        )
 
 # ------------------ FOOD PARSER PROMPT ------------------
 
@@ -330,13 +558,21 @@ async def home(request: Request):
 
 @app.get("/foods/search", response_class=HTMLResponse)
 async def usda_api(request: Request, query: str):
-    query = clean_voice_input(query)
+    query = clean_voice_input(validate_query(query))
     foods = await extract_foods_with_ai(query)
     return await process_foods(request, foods)
 
 @app.get("/api/foods/search")
-async def usda_api_json(query: str):
-    query = clean_voice_input(query)
+async def usda_api_json(
+    request: Request,
+    query: str,
+    user: dict = Depends(get_current_user),
+):
+    query = clean_voice_input(validate_query(query))
+    apply_rate_limit(user["id"], "foods_search", limit=60, window_seconds=60)
+    if request.client and request.client.host:
+        apply_rate_limit(request.client.host, "foods_search_ip", limit=90, window_seconds=60)
+
     foods = await extract_foods_with_ai(query)
     results, totals = await compute_results_and_totals(foods)
     return {
@@ -344,6 +580,398 @@ async def usda_api_json(query: str):
         "results": results,
         "totals": totals,
     }
+
+
+@app.get("/api/me")
+async def me(user: dict = Depends(get_current_user)):
+    return {
+        "id": user.get("id"),
+        "email": user.get("email"),
+        "role": user.get("role"),
+    }
+
+
+@app.get("/api/profile")
+async def get_profile(user: dict = Depends(get_current_user)):
+    client = get_admin_supabase_or_503()
+    user_id = user["id"]
+
+    try:
+        response = (
+            client.table("profiles")
+            .select("user_id, full_name, daily_calorie_goal, protein_goal_g, carb_goal_g, fat_goal_g, updated_at")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = response.data or []
+
+        if rows:
+            return rows[0]
+
+        return {
+            "user_id": user_id,
+            "full_name": user.get("user_metadata", {}).get("full_name"),
+            "daily_calorie_goal": 2300,
+            "protein_goal_g": 180,
+            "carb_goal_g": 220,
+            "fat_goal_g": 70,
+            "updated_at": None,
+        }
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            try:
+                users_response = (
+                    client.table("users")
+                    .select("id, email, display_name, daily_calorie_goal, created_at, updated_at")
+                    .eq("id", user_id)
+                    .limit(1)
+                    .execute()
+                )
+                users_rows = users_response.data or []
+                if users_rows:
+                    row = users_rows[0]
+                    return {
+                        "user_id": row.get("id"),
+                        "full_name": row.get("display_name"),
+                        "daily_calorie_goal": row.get("daily_calorie_goal") or 2300,
+                        "protein_goal_g": 180,
+                        "carb_goal_g": 220,
+                        "fat_goal_g": 70,
+                        "updated_at": row.get("updated_at"),
+                    }
+
+                return {
+                    "user_id": user_id,
+                    "full_name": user.get("user_metadata", {}).get("full_name"),
+                    "daily_calorie_goal": 2300,
+                    "protein_goal_g": 180,
+                    "carb_goal_g": 220,
+                    "fat_goal_g": 70,
+                    "updated_at": None,
+                }
+            except Exception as users_exc:
+                translated = _translate_supabase_error(users_exc)
+                logger.exception("Failed to fetch profile from users fallback")
+                raise translated
+
+        translated = _translate_supabase_error(exc)
+        logger.exception("Failed to fetch profile")
+        raise translated
+
+
+@app.put("/api/profile")
+async def update_profile(
+    payload: ProfileUpdateRequest,
+    user: dict = Depends(get_current_user),
+):
+    client = get_admin_supabase_or_503()
+    user_id = user["id"]
+
+    profile_payload = {"user_id": user_id}
+    updates = payload.model_dump(exclude_none=True)
+    profile_payload.update(updates)
+
+    try:
+        response = (
+            client.table("profiles")
+            .upsert(profile_payload, on_conflict="user_id")
+            .execute()
+        )
+        rows = response.data or []
+        return rows[0] if rows else profile_payload
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            users_payload = {"id": user_id}
+            email = user.get("email")
+            if email:
+                users_payload["email"] = email
+
+            if "full_name" in updates:
+                users_payload["display_name"] = updates["full_name"]
+            if "daily_calorie_goal" in updates:
+                users_payload["daily_calorie_goal"] = updates["daily_calorie_goal"]
+
+            try:
+                users_response = (
+                    client.table("users")
+                    .upsert(users_payload, on_conflict="id")
+                    .execute()
+                )
+                users_rows = users_response.data or []
+                row = users_rows[0] if users_rows else users_payload
+                return {
+                    "user_id": row.get("id", user_id),
+                    "full_name": row.get("display_name"),
+                    "daily_calorie_goal": row.get("daily_calorie_goal") or 2300,
+                    "protein_goal_g": 180,
+                    "carb_goal_g": 220,
+                    "fat_goal_g": 70,
+                    "updated_at": row.get("updated_at"),
+                }
+            except Exception as users_exc:
+                translated = _translate_supabase_error(users_exc)
+                logger.exception("Failed to update profile in users fallback")
+                raise translated
+
+        translated = _translate_supabase_error(exc)
+        logger.exception("Failed to update profile")
+        raise translated
+
+
+@app.get("/api/journal/entries")
+async def list_journal_entries(
+    user: dict = Depends(get_current_user),
+    limit: int = 50,
+):
+    client = get_admin_supabase_or_503()
+    user_id = user["id"]
+    safe_limit = max(1, min(limit, 200))
+
+    try:
+        response = (
+            client.table("journal_entries")
+            .select("id, user_id, food_name, quantity, calories, protein_g, carbs_g, fat_g, logged_at, created_at")
+            .eq("user_id", user_id)
+            .order("logged_at", desc=True)
+            .limit(safe_limit)
+            .execute()
+        )
+        return {"entries": response.data or []}
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            try:
+                fallback_response = (
+                    client.table("daily_logs")
+                    .select("id, user_id, food_name, calories, protein, carbs, fat, logged_at, created_at")
+                    .eq("user_id", user_id)
+                    .order("logged_at", desc=True)
+                    .limit(safe_limit)
+                    .execute()
+                )
+                mapped_entries = []
+                for row in fallback_response.data or []:
+                    mapped_entries.append(
+                        {
+                            "id": row.get("id"),
+                            "user_id": row.get("user_id"),
+                            "food_name": row.get("food_name"),
+                            "quantity": 1,
+                            "calories": row.get("calories"),
+                            "protein_g": row.get("protein"),
+                            "carbs_g": row.get("carbs"),
+                            "fat_g": row.get("fat"),
+                            "logged_at": row.get("logged_at"),
+                            "created_at": row.get("created_at"),
+                        }
+                    )
+                return {"entries": mapped_entries}
+            except Exception as fallback_exc:
+                translated = _translate_supabase_error(fallback_exc)
+                logger.exception("Failed to list journal entries from daily_logs fallback")
+                raise translated
+
+        translated = _translate_supabase_error(exc)
+        logger.exception("Failed to list journal entries")
+        raise translated
+
+
+@app.post("/api/journal/entries")
+async def create_journal_entry(
+    payload: JournalEntryCreateRequest,
+    user: dict = Depends(get_current_user),
+):
+    client = get_admin_supabase_or_503()
+    user_id = user["id"]
+
+    entry_payload = payload.model_dump()
+    entry_payload["user_id"] = user_id
+
+    try:
+        response = client.table("journal_entries").insert(entry_payload).execute()
+        rows = response.data or []
+        return rows[0] if rows else entry_payload
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            fallback_payload = {
+                "user_id": user_id,
+                "food_name": payload.food_name,
+                "calories": payload.calories if payload.calories is not None else 0,
+                "protein": payload.protein_g if payload.protein_g is not None else 0,
+                "carbs": payload.carbs_g if payload.carbs_g is not None else 0,
+                "fat": payload.fat_g if payload.fat_g is not None else 0,
+            }
+
+            try:
+                fallback_response = client.table("daily_logs").insert(fallback_payload).execute()
+                rows = fallback_response.data or []
+                row = rows[0] if rows else fallback_payload
+                return {
+                    "id": row.get("id"),
+                    "user_id": row.get("user_id", user_id),
+                    "food_name": row.get("food_name", payload.food_name),
+                    "quantity": payload.quantity,
+                    "calories": row.get("calories"),
+                    "protein_g": row.get("protein"),
+                    "carbs_g": row.get("carbs"),
+                    "fat_g": row.get("fat"),
+                    "logged_at": row.get("logged_at"),
+                    "created_at": row.get("created_at"),
+                }
+            except Exception as fallback_exc:
+                translated = _translate_supabase_error(fallback_exc)
+                logger.exception("Failed to create journal entry in daily_logs fallback")
+                raise translated
+
+        translated = _translate_supabase_error(exc)
+        logger.exception("Failed to create journal entry")
+        raise translated
+
+
+@app.put("/api/journal/entries/{entry_id}")
+async def update_journal_entry(
+    entry_id: str,
+    payload: JournalEntryUpdateRequest,
+    user: dict = Depends(get_current_user),
+):
+    client = get_admin_supabase_or_503()
+    user_id = user["id"]
+
+    updates = payload.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one field is required for update.",
+        )
+
+    try:
+        response = (
+            client.table("journal_entries")
+            .update(updates)
+            .eq("id", entry_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        rows = response.data or []
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Journal entry not found.",
+            )
+        return rows[0]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            fallback_updates = {}
+            if "food_name" in updates:
+                fallback_updates["food_name"] = updates["food_name"]
+            if "calories" in updates:
+                fallback_updates["calories"] = updates["calories"]
+            if "protein_g" in updates:
+                fallback_updates["protein"] = updates["protein_g"]
+            if "carbs_g" in updates:
+                fallback_updates["carbs"] = updates["carbs_g"]
+            if "fat_g" in updates:
+                fallback_updates["fat"] = updates["fat_g"]
+
+            if not fallback_updates:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Only food name and macro updates are supported with daily_logs fallback schema.",
+                )
+
+            try:
+                fallback_response = (
+                    client.table("daily_logs")
+                    .update(fallback_updates)
+                    .eq("id", entry_id)
+                    .eq("user_id", user_id)
+                    .execute()
+                )
+                rows = fallback_response.data or []
+                if not rows:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Journal entry not found.",
+                    )
+                row = rows[0]
+                return {
+                    "id": row.get("id"),
+                    "user_id": row.get("user_id", user_id),
+                    "food_name": row.get("food_name"),
+                    "quantity": 1,
+                    "calories": row.get("calories"),
+                    "protein_g": row.get("protein"),
+                    "carbs_g": row.get("carbs"),
+                    "fat_g": row.get("fat"),
+                    "logged_at": row.get("logged_at"),
+                    "created_at": row.get("created_at"),
+                }
+            except HTTPException:
+                raise
+            except Exception as fallback_exc:
+                translated = _translate_supabase_error(fallback_exc)
+                logger.exception("Failed to update journal entry in daily_logs fallback")
+                raise translated
+
+        translated = _translate_supabase_error(exc)
+        logger.exception("Failed to update journal entry")
+        raise translated
+
+
+@app.delete("/api/journal/entries/{entry_id}")
+async def delete_journal_entry(
+    entry_id: str,
+    user: dict = Depends(get_current_user),
+):
+    client = get_admin_supabase_or_503()
+    user_id = user["id"]
+
+    try:
+        response = (
+            client.table("journal_entries")
+            .delete()
+            .eq("id", entry_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        rows = response.data or []
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Journal entry not found.",
+            )
+        return {"deleted": True, "id": entry_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            try:
+                fallback_response = (
+                    client.table("daily_logs")
+                    .delete()
+                    .eq("id", entry_id)
+                    .eq("user_id", user_id)
+                    .execute()
+                )
+                rows = fallback_response.data or []
+                if not rows:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Journal entry not found.",
+                    )
+                return {"deleted": True, "id": entry_id}
+            except HTTPException:
+                raise
+            except Exception as fallback_exc:
+                translated = _translate_supabase_error(fallback_exc)
+                logger.exception("Failed to delete journal entry in daily_logs fallback")
+                raise translated
+
+        translated = _translate_supabase_error(exc)
+        logger.exception("Failed to delete journal entry")
+        raise translated
 
 @app.post("/voice")
 async def voice_input(request: Request, file: UploadFile = File(...)):
@@ -357,7 +985,15 @@ async def voice_input(request: Request, file: UploadFile = File(...)):
     return await process_foods(request, foods, transcript=transcript)
 
 @app.post("/api/voice")
-async def voice_input_json(file: UploadFile = File(...)):
+async def voice_input_json(
+    request: Request,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    apply_rate_limit(user["id"], "voice", limit=20, window_seconds=60)
+    if request.client and request.client.host:
+        apply_rate_limit(request.client.host, "voice_ip", limit=35, window_seconds=60)
+
     transcript = await transcribe_audio(file)
     if not transcript:
         return {"error": "Transcription failed"}
@@ -388,8 +1024,26 @@ def normalize_transcript(text: str):
 # ------------------ WHISPER ------------------
 
 async def transcribe_audio(file):
+    if file.content_type not in ALLOWED_AUDIO_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Unsupported audio type.",
+        )
+
     try:
         audio_bytes = await file.read()
+        if not audio_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Uploaded file is empty.",
+            )
+
+        if len(audio_bytes) > MAX_AUDIO_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Audio file too large. Max {MAX_AUDIO_BYTES // (1024 * 1024)}MB.",
+            )
+
         filename = file.filename or "audio.webm"
         content_type = file.content_type or "application/octet-stream"
         response = stt_client.audio.transcriptions.create(
@@ -397,8 +1051,10 @@ async def transcribe_audio(file):
             model="whisper-large-v3-turbo"
         )
         return response.text
+    except HTTPException:
+        raise
     except Exception as e:
-        print("Whisper error:", e)
+        logger.warning("Whisper transcription failed: %s", type(e).__name__)
         return None
 
 # ------------------ GROQ ------------------
@@ -416,7 +1072,7 @@ def safe_groq_call(user_prompt: str, system_prompt: str):
         )
         return response.choices[0].message.content
     except Exception as e:
-        print("Groq error:", e)
+        logger.warning("Groq call failed: %s", type(e).__name__)
         return None
 
 # ------------------ JSON ------------------

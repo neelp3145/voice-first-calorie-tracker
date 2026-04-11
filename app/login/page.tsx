@@ -1,7 +1,70 @@
+"use client";
+
 import Image from "next/image";
 import Link from "next/link";
+import { FormEvent, useState } from "react";
+
+import { getSupabaseClient } from "../../lib/supabase";
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return fallback;
+}
 
 export default function LoginPage() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleEmailSignIn = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setError("");
+    setIsSubmitting(true);
+
+    try {
+      const supabase = getSupabaseClient();
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+
+      if (signInError) {
+        throw signInError;
+      }
+
+      window.location.href = "/logger";
+    } catch (caughtError: unknown) {
+      setError(getErrorMessage(caughtError, "Unable to sign in."));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setError("");
+    setIsSubmitting(true);
+
+    try {
+      const supabase = getSupabaseClient();
+      const { error: oauthError } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo: `${window.location.origin}/logger`,
+        },
+      });
+
+      if (oauthError) {
+        throw oauthError;
+      }
+    } catch (caughtError: unknown) {
+      setError(getErrorMessage(caughtError, "Google sign-in failed."));
+      setIsSubmitting(false);
+    }
+  };
+
   return (
     <main className="relative min-h-screen overflow-hidden bg-gradient-to-b from-[#0b1220] via-[#0b1220] to-[#07121a] text-white">
       <div className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -30,7 +93,12 @@ export default function LoginPage() {
           </div>
 
           <div className="mt-8 space-y-3">
-            <button className="flex w-full items-center justify-center gap-3 rounded-2xl bg-white px-4 py-3 text-sm font-medium text-black transition hover:opacity-90">
+            <button
+              type="button"
+              disabled={isSubmitting}
+              onClick={handleGoogleSignIn}
+              className="flex w-full items-center justify-center gap-3 rounded-2xl bg-white px-4 py-3 text-sm font-medium text-black transition hover:opacity-90 disabled:opacity-60"
+            >
               <span className="text-base">G</span>
               Continue with Google
             </button>
@@ -47,12 +115,15 @@ export default function LoginPage() {
             <div className="h-px flex-1 bg-white/10" />
           </div>
 
-          <form className="space-y-4">
+          <form className="space-y-4" onSubmit={handleEmailSignIn}>
             <div>
               <label className="mb-2 block text-sm text-white/70">Email</label>
               <input
                 type="email"
                 placeholder="Enter your email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                required
                 className="w-full rounded-2xl bg-white/10 px-4 py-3 text-sm text-white outline-none ring-1 ring-white/10 placeholder:text-white/35 focus:ring-emerald-500/30"
               />
             </div>
@@ -62,12 +133,21 @@ export default function LoginPage() {
               <input
                 type="password"
                 placeholder="Enter your password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                required
                 className="w-full rounded-2xl bg-white/10 px-4 py-3 text-sm text-white outline-none ring-1 ring-white/10 placeholder:text-white/35 focus:ring-emerald-500/30"
               />
             </div>
 
-            <button className="w-full rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-semibold text-[#08131a] transition hover:bg-emerald-400">
-              Sign in with Email
+            {error ? <p className="text-sm text-red-300">{error}</p> : null}
+
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="w-full rounded-2xl bg-emerald-500 px-4 py-3 text-sm font-semibold text-[#08131a] transition hover:bg-emerald-400 disabled:opacity-60"
+            >
+              {isSubmitting ? "Signing in..." : "Sign in with Email"}
             </button>
           </form>
 

@@ -6,10 +6,17 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "security:smoke": "bash ./scripts/security_smoke_test.sh",
+    "security:identity": "bash ./scripts/security_identity_test.sh",
+    "security:rls": "bash ./scripts/security_rls_test.sh",
+    "validate:no-secrets": "bash ./scripts/validate_no_secrets.sh"
   },
   "dependencies": {
-    "next": "16.1.6",
+    "@supabase/auth-helpers-nextjs": "^0.15.0",
+    "@supabase/supabase-js": "^2.57.4",
+    "jose": "^6.2.2",
+    "next": "^16.2.3",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },

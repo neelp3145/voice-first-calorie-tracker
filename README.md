@@ -16,9 +16,12 @@ USDA_API_KEY=your_usda_key
 GROQ_API_KEY=your_groq_key
 TAVILY_API_KEY=your_tavily_key
 SUPABASE_URL=your_supabase_url
+SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
 ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
 EOF
 ```
 
@@ -74,6 +77,7 @@ TAVILY_API_KEY=your_tavily_key
 
 # Optional unless using Supabase integration
 SUPABASE_URL=your_supabase_url
+SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
 
 # Optional CORS override (comma-separated)
@@ -81,6 +85,10 @@ ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 
 # Frontend -> backend URL
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+
+# Frontend Supabase Auth variables
+NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
 ```
 
 ## 3) Set Up Python Backend
@@ -144,3 +152,35 @@ The logger page calls backend endpoints such as:
 
 - Image assets not loading on Linux
 	- Filenames in `public/` are case-sensitive (for example `.PNG` vs `.png`)
+
+## Security Operations
+
+- Security implementation overview: `docs/security_implementation_guide.md`.
+- CI security checks are defined in `.github/workflows/security-checks.yml`.
+- Abuse test scenarios are in `docs/security_abuse_test_matrix.md`.
+- Incident response steps are in `docs/security_incident_playbook.md`.
+- Local security smoke checks: `npm run security:smoke`.
+- Identity-binding checks (requires JWT): `ACCESS_TOKEN=<valid_jwt> npm run security:identity`.
+- RLS policy verification (requires two user JWTs): `ACCESS_TOKEN_A=<user_a_jwt> ACCESS_TOKEN_B=<user_b_jwt> npm run security:rls`.
+
+### Apply Database Security Migration (Supabase)
+
+Run the SQL in:
+
+- `supabase/migrations/20260411_initial_security_schema.sql`
+
+This migration applies/updates:
+
+- Owner-bound RLS policies for `users`, `daily_logs`, and `personal_foods`
+- Explicit RLS lock-down for currently-unused `food_searches` and `global_foods`
+- Verification snippets for negative access tests
+
+RLS verification script prerequisites:
+
+- `SUPABASE_URL` (or `NEXT_PUBLIC_SUPABASE_URL`)
+- `SUPABASE_ANON_KEY` (or `NEXT_PUBLIC_SUPABASE_ANON_KEY`)
+- `ACCESS_TOKEN_A` and `ACCESS_TOKEN_B` from two different authenticated users
+
+### HTTPS Deployment Note
+
+For production, terminate TLS at your reverse proxy/load balancer and forward only HTTPS traffic to users. Keep `ALLOWED_ORIGINS` restricted to trusted frontend hosts.

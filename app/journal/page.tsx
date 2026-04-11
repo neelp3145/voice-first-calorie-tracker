@@ -2,7 +2,13 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+
+import { ensureAuthenticatedOrRedirect } from "../../lib/auth";
+import { getAccessToken } from "../../lib/supabase";
+
+const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 type Meal = {
   id: string;
@@ -19,78 +25,25 @@ type JournalDay = {
   meals: Meal[];
 };
 
-const initialJournalEntries: JournalDay[] = [
-  {
-    id: "today",
-    day: "Today",
-    date: "April 6, 2026",
-    meals: [
-      {
-        id: "m1",
-        name: "Eggs and Toast",
-        time: "8:10 AM",
-        calories: "430 kcal",
-        protein: "22g",
-      },
-      {
-        id: "m2",
-        name: "Grilled Chicken Bowl",
-        time: "1:15 PM",
-        calories: "620 kcal",
-        protein: "48g",
-      },
-      {
-        id: "m3",
-        name: "Protein Shake",
-        time: "4:20 PM",
-        calories: "280 kcal",
-        protein: "30g",
-      },
-      {
-        id: "m4",
-        name: "Salmon Rice Plate",
-        time: "7:45 PM",
-        calories: "510 kcal",
-        protein: "42g",
-      },
-    ],
-  },
-  {
-    id: "yesterday",
-    day: "Yesterday",
-    date: "April 5, 2026",
-    meals: [
-      {
-        id: "m5",
-        name: "Greek Yogurt Bowl",
-        time: "9:00 AM",
-        calories: "350 kcal",
-        protein: "20g",
-      },
-      {
-        id: "m6",
-        name: "Turkey Sandwich",
-        time: "1:05 PM",
-        calories: "540 kcal",
-        protein: "34g",
-      },
-      {
-        id: "m7",
-        name: "Chicken Alfredo",
-        time: "8:00 PM",
-        calories: "760 kcal",
-        protein: "41g",
-      },
-      {
-        id: "m8",
-        name: "Casein Shake",
-        time: "10:15 PM",
-        calories: "390 kcal",
-        protein: "28g",
-      },
-    ],
-  },
-];
+type BackendJournalEntry = {
+  id: string;
+  user_id: string;
+  food_name: string;
+  quantity?: number;
+  calories?: number;
+  protein_g?: number;
+  carbs_g?: number;
+  fat_g?: number;
+  logged_at?: string;
+  created_at?: string;
+};
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return fallback;
+}
 
 const DAILY_GOAL = 2300;
 const CARB_ESTIMATE = 165;
@@ -109,40 +62,177 @@ function formatProtein(total: number) {
   return `${total}g`;
 }
 
-export default function JournalPage() {
-  const [journalEntries, setJournalEntries] =
-    useState<JournalDay[]>(initialJournalEntries);
+function formatDayLabel(date: Date): string {
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
 
-  const handleSaveMeal = (
+  const currentDay = date.toDateString();
+  if (currentDay === today.toDateString()) return "Today";
+  if (currentDay === yesterday.toDateString()) return "Yesterday";
+  return date.toLocaleDateString(undefined, { weekday: "long" });
+}
+
+function mapEntriesToDays(entries: BackendJournalEntry[]): JournalDay[] {
+  const groups = new Map<string, JournalDay>();
+
+  for (const entry of entries) {
+    const timestamp = entry.logged_at ?? entry.created_at ?? new Date().toISOString();
+    const dateObj = new Date(timestamp);
+    const dateKey = dateObj.toISOString().slice(0, 10);
+
+    if (!groups.has(dateKey)) {
+      groups.set(dateKey, {
+        id: dateKey,
+        day: formatDayLabel(dateObj),
+        date: dateObj.toLocaleDateString(undefined, {
+          month: "long",
+          day: "numeric",
+          year: "numeric",
+        }),
+        meals: [],
+      });
+    }
+
+    groups.get(dateKey)?.meals.push({
+      id: String(entry.id),
+      name: entry.food_name,
+      time: dateObj.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+      calories: `${Math.round(entry.calories ?? 0)} kcal`,
+      protein: `${Math.round(entry.protein_g ?? 0)}g`,
+    });
+  }
+
+  return Array.from(groups.values()).sort((a, b) => (a.id < b.id ? 1 : -1));
+}
+
+export default function JournalPage() {
+  const [journalEntries, setJournalEntries] = useState<JournalDay[]>([]);
+  const [statusMessage, setStatusMessage] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    const loadJournal = async () => {
+      const isAuthenticated = await ensureAuthenticatedOrRedirect();
+      if (!isAuthenticated) return;
+
+      try {
+        const accessToken = await getAccessToken();
+        if (!accessToken) {
+          window.location.href = "/login";
+          return;
+        }
+
+        const response = await fetch(`${API_BASE_URL}/api/journal/entries?limit=200`, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        });
+
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail ?? `Failed to load journal (${response.status})`);
+        }
+
+        const data = await response.json();
+        const mapped = mapEntriesToDays((data.entries ?? []) as BackendJournalEntry[]);
+        setJournalEntries(mapped);
+      } catch (error: unknown) {
+        setStatusMessage(getErrorMessage(error, "Failed to load journal entries."));
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    loadJournal();
+  }, []);
+
+  const handleSaveMeal = async (
     dayId: string,
     mealId: string,
     updatedMeal: { name: string; calories: string; protein: string }
   ) => {
-    setJournalEntries((prev) =>
-      prev.map((day) =>
-        day.id === dayId
-          ? {
-              ...day,
-              meals: day.meals.map((meal) =>
-                meal.id === mealId ? { ...meal, ...updatedMeal } : meal
-              ),
-            }
-          : day
-      )
-    );
+    setStatusMessage("");
+
+    try {
+      const accessToken = await getAccessToken();
+      if (!accessToken) {
+        throw new Error("Your session has expired. Please sign in again.");
+      }
+
+      const response = await fetch(`${API_BASE_URL}/api/journal/entries/${mealId}`, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          food_name: updatedMeal.name,
+          calories: parseNumber(updatedMeal.calories),
+          protein_g: parseNumber(updatedMeal.protein),
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail ?? `Failed to update meal (${response.status})`);
+      }
+
+      setJournalEntries((prev) =>
+        prev.map((day) =>
+          day.id === dayId
+            ? {
+                ...day,
+                meals: day.meals.map((meal) =>
+                  meal.id === mealId ? { ...meal, ...updatedMeal } : meal
+                ),
+              }
+            : day
+        )
+      );
+      setStatusMessage("Meal updated.");
+    } catch (error: unknown) {
+      setStatusMessage(getErrorMessage(error, "Failed to update meal."));
+    }
   };
 
-  const handleDeleteMeal = (dayId: string, mealId: string) => {
-    setJournalEntries((prev) =>
-      prev.map((day) =>
-        day.id === dayId
-          ? {
-              ...day,
-              meals: day.meals.filter((meal) => meal.id !== mealId),
-            }
-          : day
-      )
-    );
+  const handleDeleteMeal = async (dayId: string, mealId: string) => {
+    setStatusMessage("");
+
+    try {
+      const accessToken = await getAccessToken();
+      if (!accessToken) {
+        throw new Error("Your session has expired. Please sign in again.");
+      }
+
+      const response = await fetch(`${API_BASE_URL}/api/journal/entries/${mealId}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail ?? `Failed to delete meal (${response.status})`);
+      }
+
+      setJournalEntries((prev) =>
+        prev
+          .map((day) =>
+            day.id === dayId
+              ? {
+                  ...day,
+                  meals: day.meals.filter((meal) => meal.id !== mealId),
+                }
+              : day
+          )
+          .filter((day) => day.meals.length > 0)
+      );
+      setStatusMessage("Meal deleted.");
+    } catch (error: unknown) {
+      setStatusMessage(getErrorMessage(error, "Failed to delete meal."));
+    }
   };
 
   const todayEntry = journalEntries[0];
@@ -259,6 +349,18 @@ export default function JournalPage() {
             <SummaryCard label="Avg protein" value={formatProtein(averageProtein)} />
           </div>
         </div>
+
+        {statusMessage ? (
+          <p className="mb-6 rounded-2xl bg-black/20 px-4 py-3 text-sm text-white/80 ring-1 ring-white/10">
+            {statusMessage}
+          </p>
+        ) : null}
+
+        {isLoading ? (
+          <div className="mb-8 rounded-3xl bg-black/20 p-5 ring-1 ring-white/10 text-sm text-white/70">
+            Loading journal entries...
+          </div>
+        ) : null}
 
         <div className="grid gap-8 lg:grid-cols-[1.05fr_0.95fr]">
           <div className="space-y-8">

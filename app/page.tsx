@@ -171,7 +171,7 @@ export default function Home() {
   );
 }
 
-function StepCard({ title, desc }: any) {
+function StepCard({ title, desc }: { title: string; desc: string }) {
   return (
     <div className="rounded-3xl bg-white/5 p-5 ring-1 ring-white/10 hover:bg-white/10">
       <p className="font-semibold">{title}</p>
@@ -180,7 +180,7 @@ function StepCard({ title, desc }: any) {
   );
 }
 
-function FeatureCard({ title, desc }: any) {
+function FeatureCard({ title, desc }: { title: string; desc: string }) {
   return (
     <div className="rounded-3xl bg-white/5 p-5 ring-1 ring-white/10 hover:bg-white/10">
       <p className="font-semibold text-emerald-300">{title}</p>
