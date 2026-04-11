@@ -2,35 +2,111 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useState } from "react";
+import { useState, useRef } from "react";
+
 
 export default function LoggerPage() {
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  const transcript =
-    "I had grilled chicken breast, white rice, and a protein shake.";
-  const estimatedCalories = "720 kcal";
-  const protein = "58g";
-  const carbs = "62g";
-  const fats = "18g";
+  const [transcript, setTranscript] = useState("");
+  const [estimatedCalories, setEstimatedCalories] = useState("");
+  const [protein, setProtein] = useState("");
+  const [carbs, setCarbs] = useState("");
+  const [fats, setFats] = useState("");
+  const [foods, setFoods] = useState<string[]>([]);
 
-  const handleMicClick = () => {
-    if (isProcessing) return;
+  // -----------------------------
+  // AUDIO REFS (NEW)
+  // -----------------------------
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
 
-    if (!isListening) {
-      setIsListening(true);
+  // -----------------------------
+  // REAL MICROPHONE LOGIC (NEW)
+  // -----------------------------
+  const handleMicClick = async () => {
+  if (isProcessing) return;
 
-      setTimeout(() => {
-        setIsListening(false);
+  // -------------------------
+  // START RECORDING
+  // -------------------------
+  if (!isListening) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, {
+          type: "audio/webm",
+        });
+
+        const formData = new FormData();
+        formData.append("file", audioBlob, "audio.webm");
+
         setIsProcessing(true);
 
-        setTimeout(() => {
+        try {
+          const res = await fetch("http://127.0.0.1:8000/voice", {
+            method: "POST",
+            body: formData,
+          });
+
+          const data = await res.json();
+
+          setTranscript(data.transcript || "");
+
+          if (data.totals) {
+            setEstimatedCalories(`${data.totals.calories ?? 0} kcal`);
+            setProtein(`${data.totals.protein_g ?? 0}g`);
+            setCarbs(`${data.totals.carbs_g ?? 0}g`);
+            setFats(`${data.totals.fat_g ?? 0}g`);
+          }
+
+          if (data.results) {
+            setFoods(data.results.map((r: any) => r.food));
+          }
+        } catch (err) {
+          console.error(err);
+        } finally {
           setIsProcessing(false);
-        }, 1800);
-      }, 2200);
+        }
+      };
+
+      mediaRecorder.start();
+      setIsListening(true);
+    } catch (err) {
+      console.error("Mic permission error:", err);
     }
-  };
+
+    return;
+  }
+
+  // -------------------------
+  // STOP RECORDING
+  // -------------------------
+  if (isListening) {
+    setIsListening(false);
+
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+
+    // stop mic tracks
+    recorder?.stream?.getTracks().forEach((track) => track.stop());
+  }
+};
 
   return (
     <main className="relative min-h-screen overflow-x-hidden bg-gradient-to-b from-[#0b1220] via-[#0b1220] to-[#07121a] text-white">

@@ -9,6 +9,7 @@ import re
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
 
 from tavily import TavilyClient
 from openai import OpenAI
@@ -25,6 +26,17 @@ if not USDA_API_KEY:
     raise RuntimeError("USDA_API_KEY not set")
 
 # ------------------ CLIENTS ------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 groq_client = OpenAI(
     api_key=GROQ_API_KEY,
@@ -266,7 +278,7 @@ async def usda_api(request: Request, query: str):
     return await process_foods(request, foods)
 
 @app.post("/voice")
-async def voice_input(request: Request, file: UploadFile = File(...)):
+async def voice_input(file: UploadFile = File(...)):
     transcript = await transcribe_audio(file)
     if not transcript:
         return {"error": "Transcription failed"}
@@ -274,7 +286,13 @@ async def voice_input(request: Request, file: UploadFile = File(...)):
     cleaned_query = clean_voice_input(normalize_transcript(transcript))
     foods = await extract_foods_with_ai(cleaned_query)
 
-    return await process_foods(request, foods, transcript=transcript)
+    results, totals = await process_foods_json(foods)
+
+    return {
+        "transcript": transcript,
+        "results": results,
+        "totals": totals
+    }
 
 # ------------------ CLEAN INPUT ------------------
 
@@ -412,49 +430,27 @@ async def fetch_usda(food_name: str):
 
 # ------------------ PROCESS ------------------
 
-async def process_foods(request, foods, transcript=None):
+async def process_foods_json(foods):
     results = []
     totals = {
         "calories": 0,
         "protein_g": 0,
         "carbs_g": 0,
-        "fat_g": 0,
-        "sugar_g": 0,
-        "fiber_g": 0,
-        "vitamin_d_mcg": 0
+        "fat_g": 0
     }
 
-    totals_available = {k: False for k in totals}
-
     for food in foods:
-        nutrition = await fetch_usda(food["food"]) or {k: "Not Available" for k in totals}
-
-        for k in nutrition:
-            if isinstance(nutrition[k], (int, float)):
-                nutrition[k] *= food["quantity"]
-                totals_available[k] = True
-            else:
-                nutrition[k] = "Not Available"
-
-        results.append({
-            "food": f"{food['quantity']} x {food['food']}",
-            **nutrition
-        })
+        nutrition = await fetch_usda(food["food"]) or {}
 
         for k in totals:
-            if isinstance(nutrition[k], (int, float)):
-                totals[k] += nutrition[k]
+            val = nutrition.get(k)
+            if isinstance(val, (int, float)):
+                totals[k] += val * food["quantity"]
 
-    for k in totals:
-        if not totals_available[k]:
-            totals[k] = "Not Available"
+        results.append({
+            "food": food["food"],
+            "quantity": food["quantity"],
+            "nutrition": nutrition
+        })
 
-    return templates.TemplateResponse(
-        "front_end.html",
-        {
-            "request": request,
-            "results": results,
-            "totals": totals,
-            "transcript": transcript
-        }
-    )
+    return results, totals
