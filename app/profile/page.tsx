@@ -4,174 +4,164 @@ import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
-import { ensureAuthenticatedOrRedirect } from "../../lib/auth";
-import { getAccessToken, getSupabaseClient } from "../../lib/supabase";
-
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-
-type ProfileSnapshot = {
-  name: string;
-  email: string;
-  dailyCalories: string;
-  proteinGoal: string;
-  carbGoal: string;
-  fatGoal: string;
-};
-
-function getErrorMessage(error: unknown, fallback: string): string {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-  return fallback;
-}
-
 export default function ProfilePage() {
   const [name, setName] = useState("Dev Bollam");
   const [email, setEmail] = useState("dev@example.com");
+
+  const [age, setAge] = useState("22");
+  const [sex, setSex] = useState("Male");
+  const [heightFeet, setHeightFeet] = useState("5");
+  const [heightInches, setHeightInches] = useState("10");
+  const [weight, setWeight] = useState("180");
+
+  const [activityLevel, setActivityLevel] = useState("Moderately Active");
+  const [goal, setGoal] = useState("Lean Bulk");
+  const [diet, setDiet] = useState("High Protein");
+
   const [dailyCalories, setDailyCalories] = useState("2300");
   const [proteinGoal, setProteinGoal] = useState("180");
   const [carbGoal, setCarbGoal] = useState("220");
   const [fatGoal, setFatGoal] = useState("70");
-  const [goal, setGoal] = useState("Lean Bulk");
-  const [diet, setDiet] = useState("High Protein");
+
+  const [useAutoGoals, setUseAutoGoals] = useState(true);
   const [isEditing, setIsEditing] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
-  const [statusMessage, setStatusMessage] = useState("");
-  const [snapshot, setSnapshot] = useState<ProfileSnapshot | null>(null);
+
+  const toNumber = (value: string) => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : 0;
+  };
+
+  const calculateGoals = () => {
+    const ageNum = toNumber(age);
+    const weightLb = toNumber(weight);
+    const feet = toNumber(heightFeet);
+    const inches = toNumber(heightInches);
+
+    if (!ageNum || !weightLb || !feet) return;
+
+    const weightKg = weightLb * 0.453592;
+    const totalInches = feet * 12 + inches;
+    const heightCm = totalInches * 2.54;
+
+    let bmr = 0;
+
+    if (sex === "Male") {
+      bmr = 10 * weightKg + 6.25 * heightCm - 5 * ageNum + 5;
+    } else {
+      bmr = 10 * weightKg + 6.25 * heightCm - 5 * ageNum - 161;
+    }
+
+    let activityMultiplier = 1.2;
+    if (activityLevel === "Lightly Active") activityMultiplier = 1.375;
+    if (activityLevel === "Moderately Active") activityMultiplier = 1.55;
+    if (activityLevel === "Very Active") activityMultiplier = 1.725;
+
+    let calories = bmr * activityMultiplier;
+
+    if (goal === "Fat Loss") calories -= 400;
+    if (goal === "Maintenance") calories += 0;
+    if (goal === "Lean Bulk") calories += 250;
+    if (goal === "Muscle Gain") calories += 400;
+
+    calories = Math.round(calories);
+
+    let proteinPerLb = 0.8;
+    if (goal === "Fat Loss") proteinPerLb = 1.0;
+    if (goal === "Lean Bulk") proteinPerLb = 0.95;
+    if (goal === "Muscle Gain") proteinPerLb = 1.0;
+
+    let protein = Math.round(weightLb * proteinPerLb);
+    let fat = Math.round((calories * 0.25) / 9);
+    let carbs = Math.round((calories - protein * 4 - fat * 9) / 4);
+
+    if (diet === "High Protein") {
+      protein = Math.round(protein * 1.1);
+      carbs = Math.round(carbs * 0.92);
+    }
+
+    if (diet === "Low Carb") {
+      carbs = Math.round(carbs * 0.65);
+      fat = Math.round((calories - protein * 4 - carbs * 4) / 9);
+    }
+
+    if (diet === "Keto") {
+      carbs = Math.round((calories * 0.08) / 4);
+      fat = Math.round((calories - protein * 4 - carbs * 4) / 9);
+    }
+
+    if (diet === "Vegetarian") {
+      carbs = Math.round(carbs * 1.05);
+    }
+
+    if (diet === "Vegan") {
+      protein = Math.round(protein * 0.92);
+      carbs = Math.round(carbs * 1.1);
+    }
+
+    setDailyCalories(String(Math.max(calories, 1200)));
+    setProteinGoal(String(Math.max(protein, 0)));
+    setCarbGoal(String(Math.max(carbs, 0)));
+    setFatGoal(String(Math.max(fat, 0)));
+  };
 
   useEffect(() => {
-    const init = async () => {
-      const isAuthenticated = await ensureAuthenticatedOrRedirect();
-      if (!isAuthenticated) return;
+    if (useAutoGoals) {
+      calculateGoals();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    age,
+    sex,
+    heightFeet,
+    heightInches,
+    weight,
+    activityLevel,
+    goal,
+    diet,
+    useAutoGoals,
+  ]);
 
-      try {
-        const accessToken = await getAccessToken();
-        if (!accessToken) {
-          window.location.href = "/login";
-          return;
-        }
+  const proteinCalories = Number(proteinGoal) * 4;
+  const carbCalories = Number(carbGoal) * 4;
+  const fatCalories = Number(fatGoal) * 9;
+  const macroTotalCalories = proteinCalories + carbCalories + fatCalories;
 
-        const supabase = getSupabaseClient();
-        const {
-          data: { user },
-        } = await supabase.auth.getUser();
+  const proteinPercent =
+    macroTotalCalories > 0
+      ? Math.round((proteinCalories / macroTotalCalories) * 100)
+      : 0;
 
-        const response = await fetch(`${API_BASE_URL}/api/profile`, {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-          },
-        });
+  const carbPercent =
+    macroTotalCalories > 0
+      ? Math.round((carbCalories / macroTotalCalories) * 100)
+      : 0;
 
-        if (!response.ok) {
-          throw new Error(`Failed to load profile (${response.status})`);
-        }
-
-        const data = await response.json();
-        const loadedName = data.full_name ?? user?.user_metadata?.full_name ?? "";
-        const loadedEmail = user?.email ?? "";
-        const loadedDailyCalories = String(data.daily_calorie_goal ?? 2300);
-
-        setName(loadedName || "User");
-        setEmail(loadedEmail || "");
-        setDailyCalories(loadedDailyCalories);
-        setProteinGoal(String(data.protein_goal_g ?? 180));
-        setCarbGoal(String(data.carb_goal_g ?? 220));
-        setFatGoal(String(data.fat_goal_g ?? 70));
-
-        setSnapshot({
-          name: loadedName || "User",
-          email: loadedEmail || "",
-          dailyCalories: loadedDailyCalories,
-          proteinGoal: String(data.protein_goal_g ?? 180),
-          carbGoal: String(data.carb_goal_g ?? 220),
-          fatGoal: String(data.fat_goal_g ?? 70),
-        });
-      } catch (error: unknown) {
-        setStatusMessage(getErrorMessage(error, "Failed to load profile."));
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    init();
-  }, []);
+  const fatPercent =
+    macroTotalCalories > 0
+      ? Math.round((fatCalories / macroTotalCalories) * 100)
+      : 0;
 
   const handleCancel = () => {
-    if (snapshot) {
-      setName(snapshot.name);
-      setEmail(snapshot.email);
-      setDailyCalories(snapshot.dailyCalories);
-      setProteinGoal(snapshot.proteinGoal);
-      setCarbGoal(snapshot.carbGoal);
-      setFatGoal(snapshot.fatGoal);
-    }
+    setName("Dev Bollam");
+    setEmail("dev@example.com");
+    setAge("22");
+    setSex("Male");
+    setHeightFeet("5");
+    setHeightInches("10");
+    setWeight("180");
+    setActivityLevel("Moderately Active");
     setGoal("Lean Bulk");
     setDiet("High Protein");
+    setDailyCalories("2300");
+    setProteinGoal("180");
+    setCarbGoal("220");
+    setFatGoal("70");
+    setUseAutoGoals(true);
     setIsEditing(false);
-    setStatusMessage("");
   };
 
-  const handleSave = async () => {
-    setStatusMessage("");
-    setIsSaving(true);
-
-    try {
-      const accessToken = await getAccessToken();
-      if (!accessToken) {
-        throw new Error("Your session has expired. Please sign in again.");
-      }
-
-      const response = await fetch(`${API_BASE_URL}/api/profile`, {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          full_name: name,
-          daily_calorie_goal: Number.parseInt(dailyCalories, 10) || 2300,
-          protein_goal_g: Number.parseInt(proteinGoal, 10) || 0,
-          carb_goal_g: Number.parseInt(carbGoal, 10) || 0,
-          fat_goal_g: Number.parseInt(fatGoal, 10) || 0,
-        }),
-      });
-
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail ?? `Failed to save profile (${response.status})`);
-      }
-
-      const saved = await response.json();
-      const nextSnapshot = {
-        name: saved.full_name ?? name,
-        email,
-        dailyCalories: String(saved.daily_calorie_goal ?? dailyCalories),
-        proteinGoal: String(saved.protein_goal_g ?? proteinGoal),
-        carbGoal: String(saved.carb_goal_g ?? carbGoal),
-        fatGoal: String(saved.fat_goal_g ?? fatGoal),
-      };
-
-      setName(nextSnapshot.name);
-      setDailyCalories(nextSnapshot.dailyCalories);
-      setProteinGoal(nextSnapshot.proteinGoal);
-      setCarbGoal(nextSnapshot.carbGoal);
-      setFatGoal(nextSnapshot.fatGoal);
-      setSnapshot(nextSnapshot);
-      setIsEditing(false);
-      setStatusMessage("Profile saved.");
-    } catch (error: unknown) {
-      setStatusMessage(getErrorMessage(error, "Failed to save profile."));
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  const handleLogout = async () => {
-    const supabase = getSupabaseClient();
-    await supabase.auth.signOut();
-    window.location.href = "/login";
+  const handleSave = () => {
+    setIsEditing(false);
   };
 
   return (
@@ -182,19 +172,20 @@ export default function ProfilePage() {
         <div className="absolute bottom-10 right-0 h-[420px] w-[420px] rounded-full bg-emerald-500/10 blur-[140px]" />
       </div>
 
-      {/* Navbar */}
       <header className="relative z-20 mx-auto flex max-w-6xl items-center justify-between px-6 py-6">
         <Link href="/" className="flex items-center gap-3">
           <Image
-            src="/vocalorie-icon.PNG"
+            src="/vocalorie-icon.png"
             alt="Vocalorie"
-            width={150}
-            height={150}
+            width={42}
+            height={42}
             className="object-contain drop-shadow-[0_0_14px_rgba(16,185,129,0.45)]"
             priority
           />
           <div className="leading-tight">
-            <p className="text-sm text-white/70">Voice-first calorie tracking</p>
+            <p className="text-sm text-white/70">
+              Voice-first calorie tracking
+            </p>
             <p className="text-lg font-semibold tracking-tight text-white">
               Vocalorie
             </p>
@@ -226,7 +217,6 @@ export default function ProfilePage() {
         </div>
       </header>
 
-      {/* Page Content */}
       <section className="relative z-10 mx-auto max-w-6xl px-6 pb-20 pt-8">
         <div className="mb-10 flex flex-col gap-6 md:flex-row md:items-end md:justify-between">
           <div>
@@ -237,7 +227,8 @@ export default function ProfilePage() {
               Your account
             </h1>
             <p className="mt-4 max-w-2xl text-lg text-white/70">
-              Manage your goals, nutrition targets, and personal preferences.
+              Personalized nutrition targets based on your body metrics,
+              activity level, and goals.
             </p>
           </div>
 
@@ -246,7 +237,6 @@ export default function ProfilePage() {
               <button
                 onClick={() => setIsEditing(true)}
                 className="rounded-full bg-emerald-500 px-5 py-3 text-sm font-semibold text-[#08131a] transition hover:bg-emerald-400"
-                disabled={isLoading}
               >
                 Edit Profile
               </button>
@@ -254,15 +244,13 @@ export default function ProfilePage() {
               <>
                 <button
                   onClick={handleSave}
-                  className="rounded-full bg-emerald-500 px-5 py-3 text-sm font-semibold text-[#08131a] transition hover:bg-emerald-400 disabled:opacity-60"
-                  disabled={isSaving}
+                  className="rounded-full bg-emerald-500 px-5 py-3 text-sm font-semibold text-[#08131a] transition hover:bg-emerald-400"
                 >
-                  {isSaving ? "Saving..." : "Save Changes"}
+                  Save Changes
                 </button>
                 <button
                   onClick={handleCancel}
                   className="rounded-full bg-white/10 px-5 py-3 text-sm font-semibold text-white ring-1 ring-white/15 transition hover:bg-white/15"
-                  disabled={isSaving}
                 >
                   Cancel
                 </button>
@@ -271,14 +259,7 @@ export default function ProfilePage() {
           </div>
         </div>
 
-        {statusMessage ? (
-          <p className="mb-6 rounded-2xl bg-black/20 px-4 py-3 text-sm text-white/80 ring-1 ring-white/10">
-            {statusMessage}
-          </p>
-        ) : null}
-
         <div className="grid gap-8 lg:grid-cols-[0.9fr_1.1fr]">
-          {/* Left side */}
           <div className="space-y-6">
             <div className="rounded-[32px] bg-white/5 p-6 ring-1 ring-white/10 backdrop-blur">
               <div className="flex items-center gap-4">
@@ -314,17 +295,13 @@ export default function ProfilePage() {
                 <button className="w-full rounded-2xl bg-white/10 px-4 py-3 text-left text-sm text-white ring-1 ring-white/10 transition hover:bg-white/15">
                   Connected devices
                 </button>
-                <button
-                  onClick={handleLogout}
-                  className="w-full rounded-2xl bg-red-500/10 px-4 py-3 text-left text-sm text-red-300 ring-1 ring-red-500/20 transition hover:bg-red-500/15"
-                >
+                <button className="w-full rounded-2xl bg-red-500/10 px-4 py-3 text-left text-sm text-red-300 ring-1 ring-red-500/20 transition hover:bg-red-500/15">
                   Log out
                 </button>
               </div>
             </div>
           </div>
 
-          {/* Right side */}
           <div className="space-y-6">
             <div className="rounded-[32px] bg-white/5 p-6 ring-1 ring-white/10 backdrop-blur">
               <p className="text-sm text-white/60">Personal info</p>
@@ -343,58 +320,244 @@ export default function ProfilePage() {
                   editable={isEditing}
                   onChange={setEmail}
                 />
-              </div>
-            </div>
-
-            <div className="rounded-[32px] bg-white/5 p-6 ring-1 ring-white/10 backdrop-blur">
-              <p className="text-sm text-white/60">Nutrition targets</p>
-              <h2 className="mt-1 text-2xl font-semibold">Daily goals</h2>
-
-              <div className="mt-6 grid gap-4 md:grid-cols-2">
                 <Field
-                  label="Calories"
-                  value={dailyCalories}
+                  label="Age"
+                  value={age}
                   editable={isEditing}
-                  onChange={setDailyCalories}
+                  onChange={setAge}
                 />
-                <Field
-                  label="Protein (g)"
-                  value={proteinGoal}
+                <SelectField
+                  label="Sex"
+                  value={sex}
                   editable={isEditing}
-                  onChange={setProteinGoal}
-                />
-                <Field
-                  label="Carbs (g)"
-                  value={carbGoal}
-                  editable={isEditing}
-                  onChange={setCarbGoal}
-                />
-                <Field
-                  label="Fats (g)"
-                  value={fatGoal}
-                  editable={isEditing}
-                  onChange={setFatGoal}
+                  onChange={setSex}
+                  options={["Male", "Female"]}
                 />
               </div>
             </div>
 
             <div className="rounded-[32px] bg-white/5 p-6 ring-1 ring-white/10 backdrop-blur">
-              <p className="text-sm text-white/60">Lifestyle preferences</p>
-              <h2 className="mt-1 text-2xl font-semibold">Profile settings</h2>
+              <p className="text-sm text-white/60">Body metrics</p>
+              <h2 className="mt-1 text-2xl font-semibold">
+                Personalized inputs
+              </h2>
 
               <div className="mt-6 grid gap-4 md:grid-cols-2">
                 <Field
+                  label="Weight (lb)"
+                  value={weight}
+                  editable={isEditing}
+                  onChange={setWeight}
+                />
+
+                <div className="rounded-2xl bg-black/20 p-4 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-white/50">
+                    Height
+                  </p>
+
+                  {isEditing ? (
+                    <div className="mt-3 flex gap-3">
+                      <input
+                        value={heightFeet}
+                        onChange={(e) => setHeightFeet(e.target.value)}
+                        className="w-full rounded-xl bg-white/10 px-3 py-3 text-sm text-white outline-none ring-1 ring-white/10 placeholder:text-white/40"
+                        placeholder="ft"
+                      />
+                      <input
+                        value={heightInches}
+                        onChange={(e) => setHeightInches(e.target.value)}
+                        className="w-full rounded-xl bg-white/10 px-3 py-3 text-sm text-white outline-none ring-1 ring-white/10 placeholder:text-white/40"
+                        placeholder="in"
+                      />
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-base font-medium text-white">
+                      {heightFeet}' {heightInches}"
+                    </p>
+                  )}
+                </div>
+
+                <SelectField
+                  label="Activity level"
+                  value={activityLevel}
+                  editable={isEditing}
+                  onChange={setActivityLevel}
+                  options={[
+                    "Sedentary",
+                    "Lightly Active",
+                    "Moderately Active",
+                    "Very Active",
+                  ]}
+                />
+
+                <SelectField
                   label="Fitness goal"
                   value={goal}
                   editable={isEditing}
                   onChange={setGoal}
+                  options={[
+                    "Fat Loss",
+                    "Maintenance",
+                    "Lean Bulk",
+                    "Muscle Gain",
+                  ]}
                 />
-                <Field
+
+                <SelectField
                   label="Diet preference"
                   value={diet}
                   editable={isEditing}
                   onChange={setDiet}
+                  options={[
+                    "High Protein",
+                    "Balanced",
+                    "Low Carb",
+                    "Keto",
+                    "Vegetarian",
+                    "Vegan",
+                  ]}
                 />
+              </div>
+            </div>
+
+            <div className="rounded-[32px] bg-white/5 p-6 ring-1 ring-white/10 backdrop-blur">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-sm text-white/60">Nutrition targets</p>
+                  <h2 className="mt-1 text-2xl font-semibold">
+                    Recommended daily goals
+                  </h2>
+                  <p className="mt-2 max-w-2xl text-sm text-white/55">
+                    Smart mode recommends calories and macros from your body
+                    metrics. Manual mode lets you override them.
+                  </p>
+                </div>
+
+                <div className="rounded-2xl bg-black/20 px-4 py-3 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-white/45">
+                    Goal mode
+                  </p>
+                  <button
+                    onClick={() => setUseAutoGoals((prev) => !prev)}
+                    disabled={!isEditing}
+                    className={`mt-2 rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                      useAutoGoals
+                        ? "bg-emerald-500 text-[#08131a]"
+                        : "bg-white/10 text-white"
+                    } ${!isEditing ? "opacity-60 cursor-not-allowed" : ""}`}
+                  >
+                    {useAutoGoals ? "Smart Auto" : "Manual Override"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-6 grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
+                <div className="rounded-[28px] bg-black/20 p-6 ring-1 ring-white/10">
+                  <p className="text-xs uppercase tracking-wide text-white/50">
+                    Main target
+                  </p>
+                  <h3 className="mt-2 text-xl font-semibold text-white">
+                    Daily Calorie Goal
+                  </h3>
+
+                  {isEditing && !useAutoGoals ? (
+                    <div className="mt-5">
+                      <label className="mb-2 block text-sm text-white/65">
+                        Calories per day
+                      </label>
+                      <input
+                        value={dailyCalories}
+                        onChange={(e) => setDailyCalories(e.target.value)}
+                        className="w-full rounded-2xl bg-white/10 px-4 py-3 text-lg font-semibold text-white outline-none ring-1 ring-white/10 placeholder:text-white/35"
+                        placeholder="2300"
+                      />
+                      <p className="mt-3 text-xs text-white/45">
+                        Manual mode is active. You can directly edit this value.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="mt-5">
+                      <p className="text-5xl font-semibold tracking-tight text-emerald-300">
+                        {dailyCalories}
+                      </p>
+                      <p className="mt-2 text-sm text-white/60">kcal per day</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="grid gap-4">
+                  <MacroGoalCard
+                    label="Protein Goal"
+                    value={proteinGoal}
+                    unit="g"
+                    color="text-emerald-300"
+                    editable={isEditing && !useAutoGoals}
+                    onChange={setProteinGoal}
+                  />
+                  <MacroGoalCard
+                    label="Carb Goal"
+                    value={carbGoal}
+                    unit="g"
+                    color="text-yellow-300"
+                    editable={isEditing && !useAutoGoals}
+                    onChange={setCarbGoal}
+                  />
+                  <MacroGoalCard
+                    label="Fat Goal"
+                    value={fatGoal}
+                    unit="g"
+                    color="text-pink-300"
+                    editable={isEditing && !useAutoGoals}
+                    onChange={setFatGoal}
+                  />
+                </div>
+              </div>
+
+              <div className="mt-6 rounded-3xl bg-black/20 p-5 ring-1 ring-white/10">
+                <p className="text-sm font-medium text-white/80">
+                  Goal strategy
+                </p>
+                <p className="mt-2 text-sm leading-6 text-white/60">
+                  Smart mode estimates your calories from body weight, height,
+                  age, sex, and activity level, then adjusts macros for your
+                  fitness goal and diet style. Manual mode lets advanced users
+                  set their own exact numbers.
+                </p>
+              </div>
+
+              <div className="mt-6 rounded-3xl bg-black/20 p-5 ring-1 ring-white/10">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium text-white/80">
+                    Macro distribution
+                  </p>
+                  <p className="text-xs text-white/45">
+                    Based on current targets
+                  </p>
+                </div>
+
+                <div className="mt-5 space-y-4">
+                  <MacroBar
+                    label="Protein"
+                    grams={proteinGoal}
+                    percent={proteinPercent}
+                    color="bg-emerald-400"
+                    textColor="text-emerald-300"
+                  />
+                  <MacroBar
+                    label="Carbs"
+                    grams={carbGoal}
+                    percent={carbPercent}
+                    color="bg-yellow-400"
+                    textColor="text-yellow-300"
+                  />
+                  <MacroBar
+                    label="Fats"
+                    grams={fatGoal}
+                    percent={fatPercent}
+                    color="bg-pink-400"
+                    textColor="text-pink-300"
+                  />
+                </div>
               </div>
             </div>
           </div>
@@ -432,17 +595,123 @@ function Field({
   );
 }
 
-function StatCard({
+function SelectField({
   label,
   value,
+  editable,
+  onChange,
+  options,
 }: {
   label: string;
   value: string;
+  editable: boolean;
+  onChange: (value: string) => void;
+  options: string[];
 }) {
   return (
     <div className="rounded-2xl bg-black/20 p-4 ring-1 ring-white/10">
       <p className="text-xs uppercase tracking-wide text-white/50">{label}</p>
+
+      {editable ? (
+        <select
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="mt-3 w-full rounded-xl bg-white/10 px-3 py-3 text-sm text-white outline-none ring-1 ring-white/10"
+        >
+          {options.map((option) => (
+            <option
+              key={option}
+              value={option}
+              className="bg-[#111827] text-white"
+            >
+              {option}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <p className="mt-3 text-base font-medium text-white">{value}</p>
+      )}
+    </div>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-2xl bg-black/20 p-4 ring-1 ring-white/10">
+      <p className="text-xs uppercase tracking-wide text-white/50">{label}</p>
       <p className="mt-2 text-lg font-semibold text-white">{value}</p>
+    </div>
+  );
+}
+
+function MacroGoalCard({
+  label,
+  value,
+  unit,
+  color,
+  editable,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  unit: string;
+  color: string;
+  editable: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="rounded-2xl bg-black/20 p-4 ring-1 ring-white/10">
+      <p className="text-xs uppercase tracking-wide text-white/50">{label}</p>
+
+      {editable ? (
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            className="w-full rounded-xl bg-white/10 px-3 py-3 text-sm text-white outline-none ring-1 ring-white/10 placeholder:text-white/40"
+            placeholder="0"
+          />
+          <span className="text-sm text-white/50">{unit}</span>
+        </div>
+      ) : (
+        <p className={`mt-3 text-2xl font-semibold ${color}`}>
+          {value}
+          <span className="ml-1 text-base text-white/55">{unit}</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
+function MacroBar({
+  label,
+  grams,
+  percent,
+  color,
+  textColor,
+}: {
+  label: string;
+  grams: string;
+  percent: number;
+  color: string;
+  textColor: string;
+}) {
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className={`text-sm font-medium ${textColor}`}>{label}</span>
+          <span className="text-xs text-white/45">{grams}g</span>
+        </div>
+        <span className="text-sm text-white/70">{percent}%</span>
+      </div>
+
+      <div className="h-2.5 w-full rounded-full bg-white/10">
+        <div
+          className={`h-2.5 rounded-full ${color} transition-all duration-300`}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
     </div>
   );
 }
