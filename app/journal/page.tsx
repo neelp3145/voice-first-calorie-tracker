@@ -38,6 +38,17 @@ type BackendJournalEntry = {
   created_at?: string;
 };
 
+type BackendJournalDayResponse = {
+  totals?: {
+    calories?: number;
+    protein?: number;
+    carbs?: number;
+    fat?: number;
+  };
+  calorie_goal?: number | null;
+  remaining_calories?: number | null;
+};
+
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -46,8 +57,11 @@ function getErrorMessage(error: unknown, fallback: string): string {
 }
 
 const DAILY_GOAL = 2300;
-const CARB_ESTIMATE = 165;
-const FAT_ESTIMATE = 54;
+
+function toSafeNumber(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 function parseNumber(value: string) {
   const num = parseInt(value.replace(/[^\d]/g, ""), 10);
@@ -108,6 +122,12 @@ function mapEntriesToDays(entries: BackendJournalEntry[]): JournalDay[] {
 
 export default function JournalPage() {
   const [journalEntries, setJournalEntries] = useState<JournalDay[]>([]);
+  const [todayStats, setTodayStats] = useState<{
+    carbs: number;
+    fat: number;
+    calorieGoal: number | null;
+    remainingCalories: number | null;
+  } | null>(null);
   const [statusMessage, setStatusMessage] = useState("");
   const [isLoading, setIsLoading] = useState(true);
 
@@ -133,6 +153,32 @@ export default function JournalPage() {
         const data = await response.json();
         const mapped = mapEntriesToDays((data.entries ?? []) as BackendJournalEntry[]);
         setJournalEntries(mapped);
+
+        const todayDate = new Date().toISOString().slice(0, 10);
+        const dayResponse = await fetch(
+          `${API_BASE_URL}/api/journal/day?journal_date=${todayDate}`,
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          }
+        );
+
+        if (dayResponse.ok) {
+          const dayData = (await dayResponse.json()) as BackendJournalDayResponse;
+          setTodayStats({
+            carbs: toSafeNumber(dayData.totals?.carbs),
+            fat: toSafeNumber(dayData.totals?.fat),
+            calorieGoal:
+              dayData.calorie_goal === null || dayData.calorie_goal === undefined
+                ? null
+                : toSafeNumber(dayData.calorie_goal),
+            remainingCalories:
+              dayData.remaining_calories === null || dayData.remaining_calories === undefined
+                ? null
+                : toSafeNumber(dayData.remaining_calories),
+          });
+        }
       } catch (error: unknown) {
         setStatusMessage(getErrorMessage(error, "Failed to load journal entries."));
       } finally {
@@ -231,7 +277,8 @@ export default function JournalPage() {
     }
   };
 
-  const todayEntry = journalEntries[0];
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const todayEntry = journalEntries.find((entry) => entry.id === todayKey);
 
   const todayCalories = useMemo(() => {
     if (!todayEntry) return 0;
@@ -271,8 +318,11 @@ export default function JournalPage() {
     return Math.round(totalProteinAcrossDays / journalEntries.length);
   }, [journalEntries]);
 
-  const remainingCalories = Math.max(DAILY_GOAL - todayCalories, 0);
-  const progressPercent = Math.min((todayCalories / DAILY_GOAL) * 100, 100);
+  const resolvedDailyGoal = todayStats?.calorieGoal ?? DAILY_GOAL;
+  const remainingCalories =
+    todayStats?.remainingCalories ?? Math.max(resolvedDailyGoal - todayCalories, 0);
+  const progressPercent =
+    resolvedDailyGoal > 0 ? Math.min((todayCalories / resolvedDailyGoal) * 100, 100) : 0;
 
   return (
     <main className="relative min-h-screen overflow-x-hidden bg-gradient-to-b from-[#0b1220] via-[#0b1220] to-[#07121a] text-white">
@@ -425,7 +475,7 @@ export default function JournalPage() {
                   <div className="text-right">
                     <p className="text-sm text-white/60">Goal</p>
                     <p className="mt-2 text-lg font-medium text-white/90">
-                      {formatCalories(DAILY_GOAL)}
+                      {formatCalories(resolvedDailyGoal)}
                     </p>
                   </div>
                 </div>
@@ -444,8 +494,8 @@ export default function JournalPage() {
 
               <div className="mt-6 grid grid-cols-3 gap-4">
                 <MacroCard label="Protein" value={formatProtein(todayProtein)} />
-                <MacroCard label="Carbs" value={formatProtein(CARB_ESTIMATE)} />
-                <MacroCard label="Fats" value={formatProtein(FAT_ESTIMATE)} />
+                <MacroCard label="Carbs" value={formatProtein(Math.round(todayStats?.carbs ?? 0))} />
+                <MacroCard label="Fats" value={formatProtein(Math.round(todayStats?.fat ?? 0))} />
               </div>
             </div>
 

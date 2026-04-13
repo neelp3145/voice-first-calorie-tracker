@@ -7,6 +7,7 @@ import json
 import re
 import logging
 import time
+from datetime import date
 from collections import defaultdict
 from threading import Lock
 
@@ -19,6 +20,7 @@ from pydantic import BaseModel, Field
 from tavily import TavilyClient
 from openai import OpenAI
 from supabase_client import supabase_admin
+from journal import get_chart_data, get_journal, get_journal_summary, is_test_food_name
 
 app = FastAPI()
 logger = logging.getLogger("vocalorie.api")
@@ -577,7 +579,7 @@ NO extra text.
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    return templates.TemplateResponse("front_end.html", {"request": request})
+    return templates.TemplateResponse(request, "front_end.html", {"request": request})
 
 @app.get("/foods/search", response_class=HTMLResponse)
 async def usda_api(request: Request, query: str):
@@ -753,47 +755,34 @@ async def list_journal_entries(
 
     try:
         response = (
-            client.table("journal_entries")
-            .select("id, user_id, food_name, quantity, calories, protein_g, carbs_g, fat_g, logged_at, created_at")
+            client.table("daily_logs")
+            .select("id, user_id, food_name, calories, protein, carbs, fat, logged_at, created_at")
             .eq("user_id", user_id)
             .order("logged_at", desc=True)
             .limit(safe_limit)
             .execute()
         )
-        return {"entries": response.data or []}
-    except Exception as exc:
-        if _is_missing_table_error(exc):
-            try:
-                fallback_response = (
-                    client.table("daily_logs")
-                    .select("id, user_id, food_name, calories, protein, carbs, fat, logged_at, created_at")
-                    .eq("user_id", user_id)
-                    .order("logged_at", desc=True)
-                    .limit(safe_limit)
-                    .execute()
-                )
-                mapped_entries = []
-                for row in fallback_response.data or []:
-                    mapped_entries.append(
-                        {
-                            "id": row.get("id"),
-                            "user_id": row.get("user_id"),
-                            "food_name": row.get("food_name"),
-                            "quantity": 1,
-                            "calories": row.get("calories"),
-                            "protein_g": row.get("protein"),
-                            "carbs_g": row.get("carbs"),
-                            "fat_g": row.get("fat"),
-                            "logged_at": row.get("logged_at"),
-                            "created_at": row.get("created_at"),
-                        }
-                    )
-                return {"entries": mapped_entries}
-            except Exception as fallback_exc:
-                translated = _translate_supabase_error(fallback_exc)
-                logger.exception("Failed to list journal entries from daily_logs fallback")
-                raise translated
+        mapped_entries = []
+        for row in response.data or []:
+            if is_test_food_name(row.get("food_name")):
+                continue
 
+            mapped_entries.append(
+                {
+                    "id": row.get("id"),
+                    "user_id": row.get("user_id"),
+                    "food_name": row.get("food_name"),
+                    "quantity": 1,
+                    "calories": row.get("calories"),
+                    "protein_g": row.get("protein"),
+                    "carbs_g": row.get("carbs"),
+                    "fat_g": row.get("fat"),
+                    "logged_at": row.get("logged_at"),
+                    "created_at": row.get("created_at"),
+                }
+            )
+        return {"entries": mapped_entries}
+    except Exception as exc:
         translated = _translate_supabase_error(exc)
         logger.exception("Failed to list journal entries")
         raise translated
@@ -807,45 +796,32 @@ async def create_journal_entry(
     client = get_admin_supabase_or_503()
     user_id = user["id"]
 
-    entry_payload = payload.model_dump()
-    entry_payload["user_id"] = user_id
+    insert_payload = {
+        "user_id": user_id,
+        "food_name": payload.food_name,
+        "calories": payload.calories if payload.calories is not None else 0,
+        "protein": payload.protein_g if payload.protein_g is not None else 0,
+        "carbs": payload.carbs_g if payload.carbs_g is not None else 0,
+        "fat": payload.fat_g if payload.fat_g is not None else 0,
+    }
 
     try:
-        response = client.table("journal_entries").insert(entry_payload).execute()
+        response = client.table("daily_logs").insert(insert_payload).execute()
         rows = response.data or []
-        return rows[0] if rows else entry_payload
+        row = rows[0] if rows else insert_payload
+        return {
+            "id": row.get("id"),
+            "user_id": row.get("user_id", user_id),
+            "food_name": row.get("food_name", payload.food_name),
+            "quantity": payload.quantity,
+            "calories": row.get("calories"),
+            "protein_g": row.get("protein"),
+            "carbs_g": row.get("carbs"),
+            "fat_g": row.get("fat"),
+            "logged_at": row.get("logged_at"),
+            "created_at": row.get("created_at"),
+        }
     except Exception as exc:
-        if _is_missing_table_error(exc):
-            fallback_payload = {
-                "user_id": user_id,
-                "food_name": payload.food_name,
-                "calories": payload.calories if payload.calories is not None else 0,
-                "protein": payload.protein_g if payload.protein_g is not None else 0,
-                "carbs": payload.carbs_g if payload.carbs_g is not None else 0,
-                "fat": payload.fat_g if payload.fat_g is not None else 0,
-            }
-
-            try:
-                fallback_response = client.table("daily_logs").insert(fallback_payload).execute()
-                rows = fallback_response.data or []
-                row = rows[0] if rows else fallback_payload
-                return {
-                    "id": row.get("id"),
-                    "user_id": row.get("user_id", user_id),
-                    "food_name": row.get("food_name", payload.food_name),
-                    "quantity": payload.quantity,
-                    "calories": row.get("calories"),
-                    "protein_g": row.get("protein"),
-                    "carbs_g": row.get("carbs"),
-                    "fat_g": row.get("fat"),
-                    "logged_at": row.get("logged_at"),
-                    "created_at": row.get("created_at"),
-                }
-            except Exception as fallback_exc:
-                translated = _translate_supabase_error(fallback_exc)
-                logger.exception("Failed to create journal entry in daily_logs fallback")
-                raise translated
-
         translated = _translate_supabase_error(exc)
         logger.exception("Failed to create journal entry")
         raise translated
@@ -895,10 +871,28 @@ async def update_journal_entry(
             detail="At least one field is required for update.",
         )
 
+    daily_log_updates = {}
+    if "food_name" in updates:
+        daily_log_updates["food_name"] = updates["food_name"]
+    if "calories" in updates:
+        daily_log_updates["calories"] = updates["calories"]
+    if "protein_g" in updates:
+        daily_log_updates["protein"] = updates["protein_g"]
+    if "carbs_g" in updates:
+        daily_log_updates["carbs"] = updates["carbs_g"]
+    if "fat_g" in updates:
+        daily_log_updates["fat"] = updates["fat_g"]
+
+    if not daily_log_updates:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Only food name and macro updates are supported.",
+        )
+
     try:
         response = (
-            client.table("journal_entries")
-            .update(updates)
+            client.table("daily_logs")
+            .update(daily_log_updates)
             .eq("id", entry_id)
             .eq("user_id", user_id)
             .execute()
@@ -909,63 +903,22 @@ async def update_journal_entry(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Journal entry not found.",
             )
-        return rows[0]
+        row = rows[0]
+        return {
+            "id": row.get("id"),
+            "user_id": row.get("user_id", user_id),
+            "food_name": row.get("food_name"),
+            "quantity": 1,
+            "calories": row.get("calories"),
+            "protein_g": row.get("protein"),
+            "carbs_g": row.get("carbs"),
+            "fat_g": row.get("fat"),
+            "logged_at": row.get("logged_at"),
+            "created_at": row.get("created_at"),
+        }
     except HTTPException:
         raise
     except Exception as exc:
-        if _is_missing_table_error(exc):
-            fallback_updates = {}
-            if "food_name" in updates:
-                fallback_updates["food_name"] = updates["food_name"]
-            if "calories" in updates:
-                fallback_updates["calories"] = updates["calories"]
-            if "protein_g" in updates:
-                fallback_updates["protein"] = updates["protein_g"]
-            if "carbs_g" in updates:
-                fallback_updates["carbs"] = updates["carbs_g"]
-            if "fat_g" in updates:
-                fallback_updates["fat"] = updates["fat_g"]
-
-            if not fallback_updates:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="Only food name and macro updates are supported with daily_logs fallback schema.",
-                )
-
-            try:
-                fallback_response = (
-                    client.table("daily_logs")
-                    .update(fallback_updates)
-                    .eq("id", entry_id)
-                    .eq("user_id", user_id)
-                    .execute()
-                )
-                rows = fallback_response.data or []
-                if not rows:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Journal entry not found.",
-                    )
-                row = rows[0]
-                return {
-                    "id": row.get("id"),
-                    "user_id": row.get("user_id", user_id),
-                    "food_name": row.get("food_name"),
-                    "quantity": 1,
-                    "calories": row.get("calories"),
-                    "protein_g": row.get("protein"),
-                    "carbs_g": row.get("carbs"),
-                    "fat_g": row.get("fat"),
-                    "logged_at": row.get("logged_at"),
-                    "created_at": row.get("created_at"),
-                }
-            except HTTPException:
-                raise
-            except Exception as fallback_exc:
-                translated = _translate_supabase_error(fallback_exc)
-                logger.exception("Failed to update journal entry in daily_logs fallback")
-                raise translated
-
         translated = _translate_supabase_error(exc)
         logger.exception("Failed to update journal entry")
         raise translated
@@ -981,7 +934,7 @@ async def delete_journal_entry(
 
     try:
         response = (
-            client.table("journal_entries")
+            client.table("daily_logs")
             .delete()
             .eq("id", entry_id)
             .eq("user_id", user_id)
@@ -997,32 +950,47 @@ async def delete_journal_entry(
     except HTTPException:
         raise
     except Exception as exc:
-        if _is_missing_table_error(exc):
-            try:
-                fallback_response = (
-                    client.table("daily_logs")
-                    .delete()
-                    .eq("id", entry_id)
-                    .eq("user_id", user_id)
-                    .execute()
-                )
-                rows = fallback_response.data or []
-                if not rows:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Journal entry not found.",
-                    )
-                return {"deleted": True, "id": entry_id}
-            except HTTPException:
-                raise
-            except Exception as fallback_exc:
-                translated = _translate_supabase_error(fallback_exc)
-                logger.exception("Failed to delete journal entry in daily_logs fallback")
-                raise translated
-
         translated = _translate_supabase_error(exc)
         logger.exception("Failed to delete journal entry")
         raise translated
+
+
+@app.get("/api/journal/day")
+async def get_journal_day(
+    journal_date: date | None = None,
+    user: dict = Depends(get_current_user),
+):
+    return get_journal(user["id"], journal_date)
+
+
+@app.get("/api/journal/summary")
+async def get_journal_summary_range(
+    start_date: date,
+    end_date: date,
+    user: dict = Depends(get_current_user),
+):
+    if start_date > end_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start_date must be on or before end_date.",
+        )
+
+    return get_journal_summary(user["id"], start_date, end_date)
+
+
+@app.get("/api/journal/chart")
+async def get_journal_chart(
+    start_date: date,
+    end_date: date,
+    user: dict = Depends(get_current_user),
+):
+    if start_date > end_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start_date must be on or before end_date.",
+        )
+
+    return get_chart_data(user["id"], start_date, end_date)
 
 @app.post("/voice")
 async def voice_input(request: Request, file: UploadFile = File(...)):

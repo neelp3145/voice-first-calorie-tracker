@@ -1,7 +1,32 @@
 from datetime import date, datetime, time, timedelta, timezone
 from collections import defaultdict
 from fastapi import HTTPException
-from supabase_client import supabase
+from supabase_client import supabase_admin
+
+
+supabase = supabase_admin
+
+TEST_FOOD_NAME_MARKERS = (
+    "identity test meal",
+    "rls test meal",
+)
+
+
+def _require_supabase_client():
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database admin client is not configured")
+
+
+def is_test_food_name(food_name: str | None) -> bool:
+    if not food_name:
+        return False
+
+    normalized = food_name.strip().lower()
+    return any(marker in normalized for marker in TEST_FOOD_NAME_MARKERS)
+
+
+def _filter_test_entries(entries: list[dict]) -> list[dict]:
+    return [entry for entry in entries if not is_test_food_name(entry.get("food_name"))]
 
 
 # -----------------------------
@@ -14,6 +39,8 @@ def add_to_journal(user_id: str, items: list[dict], logged_at: datetime = None):
     """
     if not items:
         raise HTTPException(status_code=400, detail="No items provided")
+
+    _require_supabase_client()
 
     logged_at = logged_at or datetime.now(timezone.utc)
 
@@ -51,6 +78,8 @@ def get_journal(user_id: str, journal_date: date = None):
     """
     day = journal_date or date.today()
 
+    _require_supabase_client()
+
     start_dt = datetime.combine(day, time.min).replace(tzinfo=timezone.utc)
     end_dt = start_dt + timedelta(days=1)
 
@@ -67,7 +96,7 @@ def get_journal(user_id: str, journal_date: date = None):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to fetch journal: {exc}")
 
-    logs = response.data or []
+    logs = _filter_test_entries(response.data or [])
 
     totals = {
         "calories": 0.0,
@@ -122,6 +151,8 @@ def update_log_entry(user_id: str, log_id: str, updates: dict):
     if not updates:
         raise HTTPException(status_code=400, detail="No updates provided")
 
+    _require_supabase_client()
+
     allowed_fields = {"food_name", "calories", "protein", "carbs", "fat"}
     clean_updates = {k: v for k, v in updates.items() if k in allowed_fields}
 
@@ -155,6 +186,8 @@ def delete_log_entry(user_id: str, log_id: str):
     """
     Delete a journal entry
     """
+    _require_supabase_client()
+
     try:
         result = (
             supabase.table("daily_logs")
@@ -182,6 +215,8 @@ def get_journal_summary(user_id: str, start_date: date, end_date: date):
     """
     Returns grouped logs by date with totals
     """
+    _require_supabase_client()
+
     start_dt = datetime.combine(start_date, time.min).replace(tzinfo=timezone.utc)
     end_dt = datetime.combine(end_date, time.max).replace(tzinfo=timezone.utc)
 
@@ -198,7 +233,7 @@ def get_journal_summary(user_id: str, start_date: date, end_date: date):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to fetch summary: {exc}")
 
-    logs = response.data or []
+    logs = _filter_test_entries(response.data or [])
 
     grouped = defaultdict(lambda: {
         "entries": [],
