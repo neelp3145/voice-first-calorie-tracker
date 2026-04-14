@@ -42,6 +42,8 @@ ALLOWED_AUDIO_TYPES = {
 RATE_LIMIT_BUCKETS = defaultdict(list)
 RATE_LIMIT_LOCK = Lock()
 
+port = int(os.environ.get("PORT", 8000))
+
 
 def validate_environment() -> None:
     required = [
