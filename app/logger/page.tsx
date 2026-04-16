@@ -519,7 +519,7 @@ export default function LoggerPage() {
             alt="Vocalorie"
             width={150}
             height={150}
-            className="object-contain drop-shadow-[0_0_14px_rgba(16,185,129,0.45)]"
+            className="h-auto w-auto object-contain drop-shadow-[0_0_14px_rgba(16,185,129,0.45)]"
             priority
           />
           <div className="leading-tight">
@@ -602,7 +602,7 @@ export default function LoggerPage() {
                   alt="Vocalorie Mic"
                   width={90}
                   height={90}
-                  className={`object-contain transition duration-300 ${
+                  className={`h-auto w-auto object-contain transition duration-300 ${
                     isListening ? "animate-pulse scale-110" : ""
                   }`}
                 />
