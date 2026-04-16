@@ -1,5 +1,6 @@
 # Core Web Server & File Handling
 fastapi
+jinja2
 uvicorn[standard]
 python-multipart>=0.0.26
 
