@@ -2,7 +2,6 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "export",
-  trailingSlash: true, 
   poweredByHeader: false,
   async headers() {
     const isProd = process.env.NODE_ENV === "production";
