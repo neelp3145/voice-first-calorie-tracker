@@ -120,6 +120,7 @@ export default function LoggerPage() {
   const [transcript, setTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [isRecognizing, setIsRecognizing] = useState(false);
+  const [displayTranscript, setDisplayTranscript] = useState(""); // NEW: Persistent transcript display
   const [apiData, setApiData] = useState<SearchResponse | null>(null);
   const [error, setError] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
@@ -220,6 +221,7 @@ export default function LoggerPage() {
 
     const data: VoiceResponse = await response.json();
     setTranscript(data.transcript || "");
+    setDisplayTranscript(data.transcript || ""); // Update display transcript
     setApiData({ query: data.query, results: data.results, totals: data.totals });
     setSelectedFoodIndex(0);
     setIsEditingMeal(false);
@@ -306,6 +308,7 @@ export default function LoggerPage() {
       setIsListening(false);
       setIsRecognizing(false);
       setInterimTranscript("");
+      // Don't clear displayTranscript - keep showing what was recognized so far
       return;
     }
 
@@ -336,6 +339,8 @@ export default function LoggerPage() {
     setIsListening(true);
     setIsRecognizing(true);
     setInterimTranscript("");
+    // Clear the accumulated final transcript when starting new recording
+    setDisplayTranscript("");
     finalTranscriptRef.current = "";
     setTranscript("");
 
@@ -380,7 +385,10 @@ export default function LoggerPage() {
 
       // Update UI with live transcription
       if (final) {
-        setTranscript(final.trim());
+        const newFinal = final.trim();
+        setTranscript(newFinal);
+        // Update displayTranscript with final text (keeps it even after stopping)
+        setDisplayTranscript(newFinal);
       }
       
       if (interim) {
@@ -407,7 +415,8 @@ export default function LoggerPage() {
       setIsListening(false);
       setIsRecognizing(false);
       
-      const finalTranscript = finalTranscriptRef.current.trim();
+      // Use the stored displayTranscript instead of clearing it
+      const finalTranscript = displayTranscript || finalTranscriptRef.current.trim();
       
       // Don't process if empty
       if (!finalTranscript) {
@@ -417,9 +426,7 @@ export default function LoggerPage() {
         return;
       }
 
-      // Set the final transcript
-      setTranscript(finalTranscript);
-      setInterimTranscript("");
+      // Keep the transcript visible
       setStatusMessage("Processing your meal...");
       setIsProcessing(true);
       
@@ -626,7 +633,7 @@ export default function LoggerPage() {
 
   const getDisplayTranscript = () => {
     if (interimTranscript && !isProcessing && isRecognizing) {
-      const finalPart = transcript || "";
+      const finalPart = displayTranscript || "";
       return (
         <span>
           {finalPart}
@@ -637,8 +644,8 @@ export default function LoggerPage() {
       );
     }
     
-    if (transcript && !isProcessing) {
-      return transcript;
+    if (displayTranscript && !isProcessing) {
+      return displayTranscript;
     }
     
     return "...";
