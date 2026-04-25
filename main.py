@@ -1202,78 +1202,54 @@ Examples:
         return 1
 
 
-async def extract_foods_with_ai(query: str):
-    """
-    Improved parser with:
-    - dish vs multi-food detection
-    - brand preservation
-    - graceful fallback
-    """
+async def extract_foods(query: str):
+    parts = re.split(r",| and ", query)
 
-    text = safe_groq_call(query, FOOD_PARSER_PROMPT)
+    foods = []
+    for part in parts:
+        part = part.strip()
+        if part:
+            foods.append({
+                "food": part,
+                "quantity": 1
+            })
 
-    if not text:
-        return [{"food": query, "quantity": 1}]
-
-    data = extract_json(text)
-
-    # ---------------- MULTIPLE FOODS ----------------
-    if isinstance(data, list):
-        foods = validate_foods(data)
-
-        # fallback if model returns empty list
-        if not foods:
-            return [{"food": query, "quantity": 1}]
-
-        return foods
-
-    # ---------------- SINGLE DISH ----------------
-    elif isinstance(data, dict) and "dish" in data:
-        return [{
-            "food": data["dish"],
-            "quantity": estimate_portion(query)
-        }]
-
-    # ---------------- FAILSAFE ----------------
-    logger.warning("AI returned unexpected format: %s", text)
-    return [{"food": query, "quantity": 1}]
+    return foods if foods else [{"food": query, "quantity": 1}]
 
 # ------------------ USDA ------------------
 
-async def fetch_usda(food_name: str):
+async def fetch_usda_with_fallback(food_name: str):
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://api.nal.usda.gov/fdc/v1/foods/search",
             params={"api_key": USDA_API_KEY},
-            json={"query": food_name, "pageSize": 10, "requireAllWords": False}
+            json={"query": food_name, "pageSize": 5}
         )
 
         if response.status_code != 200:
             return None
 
         foods = response.json().get("foods", [])
+
         if not foods:
+            # 🔥 Trigger agent fallback
+            improved_query = await resolve_with_agent(food_name)
+
+            if improved_query != food_name:
+                return await fetch_usda_with_fallback(improved_query)
+
             return None
 
-        selected = select_usda_candidate(food_name, foods)
+        selected = await fetch_usda_with_fallback(food_name)
 
-        lookup = {
-            "Energy": "calories",
-            "Protein": "protein_g",
-            "Carbohydrate, by difference": "carbs_g",
-            "Total lipid (fat)": "fat_g",
-            "Sugars, total including NLEA": "sugar_g",
-            "Fiber, total dietary": "fiber_g",
-            "Vitamin D (D2 + D3), International Units": "vitamin_d_mcg"
-        }
+        # 🔥 Check confidence
+        if is_low_confidence_match(food_name, best):
+            improved_query = await resolve_with_agent(food_name)
 
-        nutrition = {v: "Not Available" for v in lookup.values()}
+            if improved_query != food_name:
+                return await fetch_usda_with_fallback(improved_query)
 
-        for n in selected.get("foodNutrients", []):
-            if n.get("nutrientName") in lookup:
-                nutrition[lookup[n["nutrientName"]]] = n.get("value", "Not Available")
-
-        return nutrition
+        return best
 
 
 def normalize_food_text(text: str) -> str:
@@ -1501,6 +1477,41 @@ def select_usda_candidate_with_ai(query: str, foods: list[dict]) -> int | None:
         return data["selected_index"]
 
     return None
+
+def is_low_confidence_match(query: str, candidate: dict) -> bool:
+    if not candidate:
+        return True
+
+    description = normalize_food_text(candidate.get("description", ""))
+    query_norm = normalize_food_text(query)
+
+    # Exact or strong match → GOOD
+    if query_norm in description:
+        return False
+
+    # Weak token overlap → BAD
+    query_tokens = set(query_norm.split())
+    desc_tokens = set(description.split())
+
+    overlap = len(query_tokens & desc_tokens)
+
+    return overlap < max(1, len(query_tokens) // 2)
+
+async def resolve_with_agent(food_name: str) -> str:
+    prompt = f"""
+The user searched for: "{food_name}"
+
+Return a better USDA-compatible food search query.
+Be concise. No explanation.
+
+Examples:
+"maggi" → "maggi instant noodles"
+"chipotle bowl" → "chicken rice bowl"
+"protein shake" → "protein shake ready to drink"
+"""
+
+    text = safe_groq_call(prompt, "Return only the improved query.")
+    return text.strip() if text else food_name
 
 # ------------------ PROCESS ------------------
 
