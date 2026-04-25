@@ -71,14 +71,6 @@ allowed_origins = [
     if origin.strip()
 ]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -109,8 +101,9 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://voice-first-calorie-tracker-frontend.onrender.com",
         "http://localhost:3000",
-        "http://127.0.0.1:3000"
+        "https://voice-first-calorie-tracker-oipo.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
