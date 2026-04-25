@@ -1123,7 +1123,7 @@ async def transcribe_audio(file):
         logger.warning("Whisper transcription failed: %s", type(e).__name__)
         return None
 
-# ------------------ GROQ ------------------
+# ------------------ AGENT (UPGRADED FOOD PARSER) ------------------
 
 def safe_groq_call(user_prompt: str, system_prompt: str):
     try:
@@ -1134,70 +1134,108 @@ def safe_groq_call(user_prompt: str, system_prompt: str):
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0,
-            max_tokens=300
+            max_tokens=400
         )
         return response.choices[0].message.content
     except Exception as e:
         logger.warning("Groq call failed: %s", type(e).__name__)
         return None
 
-# ------------------ JSON ------------------
 
 def extract_json(text):
     try:
         return json.loads(text)
     except:
-        return None
+        # attempt to recover JSON if model adds noise
+        try:
+            match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+        except:
+            return None
+    return None
 
-# ------------------ VALIDATE ------------------
 
 def validate_foods(data):
     clean = []
+
     for item in data:
         try:
             clean_item = {
-                "food": item["food"],
+                "food": str(item["food"]).strip(),
                 "quantity": float(item.get("quantity", 1)),
             }
 
-            for optional_key in ("brand", "intent", "raw_food", "descriptor"):
+            if clean_item["quantity"] <= 0:
+                clean_item["quantity"] = 1
+
+            for optional_key in ("brand", "intent"):
                 if optional_key in item and item[optional_key]:
                     clean_item[optional_key] = item[optional_key]
 
             clean.append(clean_item)
         except:
             continue
+
     return clean
 
-# ------------------ PORTION ------------------
 
 def estimate_portion(text: str):
     try:
         result = safe_groq_call(text, """
-Return ONLY JSON: {"quantity": number} Rules: 1. NUMBER WORDS - one → 1, two → 2, three → 3, four → 4, five → 5 - a/an → 1 - half → 0.5, quarter → 0.25 - If a decimal is written (e.g., 1.5) → use it directly 2. UNITS - bowl, plate, cup, glass, slice → do NOT multiply; unit only helps clarify - Ignore words like 'serving', 'piece', 'portion' unless numeric 3. DEFAULT - If no number found → 1 - Fractions or mixed numbers should be handled correctly EXAMPLES: - "one bowl pasta" → 1 - "two bowls pasta" → 2 - "half cup rice" → 0.5 - "1.5 slices bread" → 1.5 - "a plate of chicken" → 1 Return JSON only, nothing else.
+Return ONLY JSON: {"quantity": number}
+
+Rules:
+- "a", "an" = 1
+- "one" = 1, "two" = 2, etc.
+- "half" = 0.5
+- If nothing specified → 1
+
+Examples:
+"one bowl pasta" → 1
+"2 slices pizza" → 2
+"half plate rice" → 0.5
 """)
         data = extract_json(result)
         return float(data.get("quantity", 1))
     except:
         return 1
 
-# ------------------ AI EXTRACTION ------------------
 
 async def extract_foods_with_ai(query: str):
+    """
+    Improved parser with:
+    - dish vs multi-food detection
+    - brand preservation
+    - graceful fallback
+    """
+
     text = safe_groq_call(query, FOOD_PARSER_PROMPT)
 
-    if text:
-        data = extract_json(text)
+    if not text:
+        return [{"food": query, "quantity": 1}]
 
-        if isinstance(data, list):
-            return validate_foods(data)
+    data = extract_json(text)
 
-        elif isinstance(data, dict) and "dish" in data:
-            return [{
-                "food": data["dish"],
-                "quantity": estimate_portion(query)
-            }]
+    # ---------------- MULTIPLE FOODS ----------------
+    if isinstance(data, list):
+        foods = validate_foods(data)
 
+        # fallback if model returns empty list
+        if not foods:
+            return [{"food": query, "quantity": 1}]
+
+        return foods
+
+    # ---------------- SINGLE DISH ----------------
+    elif isinstance(data, dict) and "dish" in data:
+        return [{
+            "food": data["dish"],
+            "quantity": estimate_portion(query)
+        }]
+
+    # ---------------- FAILSAFE ----------------
+    logger.warning("AI returned unexpected format: %s", text)
     return [{"food": query, "quantity": 1}]
 
 # ------------------ USDA ------------------
