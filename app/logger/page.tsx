@@ -108,6 +108,8 @@ export default function LoggerPage() {
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [transcript, setTranscript] = useState("");
+  const [interimTranscript, setInterimTranscript] = useState("");
+  const [isRecognizing, setIsRecognizing] = useState(false);
   const [apiData, setApiData] = useState<SearchResponse | null>(null);
   const [error, setError] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
@@ -125,6 +127,7 @@ export default function LoggerPage() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const finalTranscriptRef = useRef<string>("");
 
   // Handle mounting to prevent hydration issues
   useEffect(() => {
@@ -291,6 +294,8 @@ export default function LoggerPage() {
         stopSpeechRecognition();
       }
       setIsListening(false);
+      setIsRecognizing(false);
+      setInterimTranscript("");
       return;
     }
 
@@ -319,6 +324,10 @@ export default function LoggerPage() {
 
     setError("");
     setIsListening(true);
+    setIsRecognizing(true);
+    setInterimTranscript("");
+    finalTranscriptRef.current = "";
+    setTranscript("");
 
     // Stop any existing recognition
     stopSpeechRecognition();
@@ -326,42 +335,89 @@ export default function LoggerPage() {
     const recognition = new SpeechRecognitionConstructor();
     recognitionRef.current = recognition;
     recognition.lang = "en-US";
-    recognition.interimResults = false;
-    recognition.continuous = false;
-
-    let finalTranscript = "";
+    recognition.interimResults = true;
+    recognition.continuous = true;
+    recognition.maxAlternatives = 1;
 
     recognition.onstart = () => {
       setIsListening(true);
+      setIsRecognizing(true);
+      setStatusMessage("Listening... speak now");
     };
 
     recognition.onresult = (event: BrowserSpeechRecognitionResultEvent) => {
-      finalTranscript = event.results[0][0].transcript;
-      setTranscript(finalTranscript);
+      let interim = "";
+      let final = "";
+
+      // Process all results
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        const transcriptText = result[0].transcript;
+        
+        if (result.isFinal) {
+          final += transcriptText + " ";
+          finalTranscriptRef.current += transcriptText + " ";
+        } else {
+          interim += transcriptText;
+        }
+      }
+
+      // Update UI with live transcription
+      if (final) {
+        setTranscript(final.trim());
+      }
+      
+      if (interim) {
+        setInterimTranscript(interim);
+        setStatusMessage("Recognizing... (keep speaking)");
+      } else {
+        setInterimTranscript("");
+        if (final) {
+          setStatusMessage("Recognized!");
+        }
+      }
     };
 
     recognition.onerror = (event: BrowserSpeechRecognitionErrorEvent) => {
       setError(`Speech error: ${event.error}`);
       setIsListening(false);
+      setIsRecognizing(false);
+      setInterimTranscript("");
+      setStatusMessage("");
       recognitionRef.current = null;
     };
 
     recognition.onend = async () => {
       setIsListening(false);
-      recognitionRef.current = null;
-
-      if (!finalTranscript.trim()) {
+      setIsRecognizing(false);
+      
+      const finalTranscript = finalTranscriptRef.current.trim();
+      
+      // Don't process if empty
+      if (!finalTranscript) {
+        setInterimTranscript("");
+        setStatusMessage("");
+        recognitionRef.current = null;
         return;
       }
 
+      // Set the final transcript
+      setTranscript(finalTranscript);
+      setInterimTranscript("");
+      setStatusMessage("Processing your meal...");
       setIsProcessing(true);
+      
       try {
         await fetchByQuery(finalTranscript);
       } catch (requestError: unknown) {
         setError(getErrorMessage(requestError, "Failed to fetch nutrition data."));
+        setStatusMessage("");
       } finally {
         setIsProcessing(false);
+        setStatusMessage("");
       }
+      
+      recognitionRef.current = null;
     };
 
     recognition.start();
@@ -552,6 +608,26 @@ export default function LoggerPage() {
     }
   };
 
+  const getDisplayTranscript = () => {
+    if (interimTranscript && !isProcessing && isRecognizing) {
+      const finalPart = transcript || "";
+      return (
+        <span>
+          {finalPart}
+          {finalPart && interimTranscript && " "}
+          <span className="text-emerald-300/70 italic">{interimTranscript}</span>
+          <span className="inline-block w-1.5 h-4 bg-emerald-400/70 animate-pulse ml-0.5 align-middle"></span>
+        </span>
+      );
+    }
+    
+    if (transcript && !isProcessing) {
+      return transcript;
+    }
+    
+    return "...";
+  };
+
   // Don't render anything until mounted to prevent hydration mismatch
   if (!mounted) {
     return null;
@@ -624,30 +700,48 @@ export default function LoggerPage() {
                 <h2 className="mt-1 text-2xl font-semibold">Speak your meal</h2>
               </div>
 
-              <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white/70 ring-1 ring-white/10">
-                {isListening ? "Listening..." : isProcessing ? "Processing..." : "Ready"}
+              <span className={`rounded-full px-3 py-1 text-xs ring-1 ${
+                isRecognizing 
+                  ? "bg-emerald-500/20 text-emerald-200 ring-emerald-500/30 animate-pulse"
+                  : isListening 
+                    ? "bg-white/10 text-white/70 ring-white/10"
+                    : isProcessing 
+                      ? "bg-sky-500/20 text-sky-200 ring-sky-500/30"
+                      : "bg-white/10 text-white/70 ring-white/10"
+              }`}>
+                {isRecognizing 
+                  ? "Speaking..." 
+                  : isListening 
+                    ? "Listening..." 
+                    : isProcessing 
+                      ? "Processing..." 
+                      : "Ready"}
               </span>
             </div>
 
             <div className="relative mt-10 flex items-center justify-center">
               <div
                 className={`absolute h-[260px] w-[260px] rounded-full blur-3xl transition ${
-                  isListening
-                    ? "bg-emerald-500/40 animate-pulse"
-                    : isProcessing
-                      ? "bg-sky-500/30"
-                      : "bg-emerald-500/15"
+                  isRecognizing
+                    ? "bg-emerald-500/50 animate-pulse"
+                    : isListening
+                      ? "bg-emerald-500/30"
+                      : isProcessing
+                        ? "bg-sky-500/30"
+                        : "bg-emerald-500/15"
                 }`}
               />
 
               <button
                 onClick={handleMicClick}
                 className={`relative z-10 flex h-40 w-40 items-center justify-center rounded-full transition duration-300 ${
-                  isListening
-                    ? "scale-110 bg-emerald-500 shadow-[0_0_80px_rgba(16,185,129,0.55)]"
-                    : isProcessing
-                      ? "bg-sky-500 shadow-[0_0_70px_rgba(56,189,248,0.45)]"
-                      : "bg-white/10 hover:scale-105 hover:bg-white/15"
+                  isRecognizing
+                    ? "scale-110 bg-emerald-500 shadow-[0_0_80px_rgba(16,185,129,0.65)] animate-pulse"
+                    : isListening
+                      ? "scale-105 bg-emerald-500 shadow-[0_0_80px_rgba(16,185,129,0.55)]"
+                      : isProcessing
+                        ? "bg-sky-500 shadow-[0_0_70px_rgba(56,189,248,0.45)]"
+                        : "bg-white/10 hover:scale-105 hover:bg-white/15"
                 }`}
               >
                 <Image
@@ -656,7 +750,7 @@ export default function LoggerPage() {
                   width={90}
                   height={90}
                   className={`h-auto w-auto object-contain transition duration-300 ${
-                    isListening ? "animate-pulse scale-110" : ""
+                    isRecognizing ? "animate-pulse scale-110" : ""
                   }`}
                 />
               </button>
@@ -683,11 +777,22 @@ export default function LoggerPage() {
                 </>
               ) : null}
 
-              {isListening ? (
+              {isListening && !isRecognizing ? (
                 <>
                   <p className="text-lg font-medium text-emerald-300">Listening...</p>
                   <p className="mt-2 text-sm text-white/60">
-                    Speak naturally. Vocalorie is capturing your meal.
+                    Tap the mic again when you&apos;re done speaking.
+                  </p>
+                </>
+              ) : null}
+
+              {isRecognizing ? (
+                <>
+                  <p className="text-lg font-medium text-emerald-300 animate-pulse">
+                    🎤 Speaking... {interimTranscript && "(live)"}
+                  </p>
+                  <p className="mt-2 text-sm text-white/60">
+                    Your words appear below. Tap the mic when finished.
                   </p>
                 </>
               ) : null}
@@ -705,9 +810,18 @@ export default function LoggerPage() {
             <div className="mt-10 rounded-3xl bg-black/20 p-5 ring-1 ring-white/10">
               <div className="flex items-center justify-between">
                 <p className="text-sm font-medium text-white/80">Transcript</p>
-                <span className="text-xs text-white/50">Preview</span>
+                <span className="text-xs text-white/50">
+                  {isRecognizing ? "Live" : "Preview"}
+                </span>
               </div>
-              <p className="mt-3 text-base leading-7 text-white/90">{transcript || "..."}</p>
+              <div className="mt-3 text-base leading-7 text-white/90 min-h-[84px]">
+                {getDisplayTranscript()}
+              </div>
+              {isRecognizing && interimTranscript && (
+                <p className="mt-2 text-xs text-emerald-300/60">
+                  ✨ Live transcription active — text updates as you speak
+                </p>
+              )}
             </div>
           </div>
 
