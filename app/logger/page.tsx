@@ -53,6 +53,7 @@ type CustomFoodDraft = {
 
 type BrowserSpeechRecognitionResultEvent = {
   results: ArrayLike<ArrayLike<{ transcript: string }>>;
+  resultIndex: number;
 };
 
 type BrowserSpeechRecognitionErrorEvent = {
