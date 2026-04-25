@@ -64,9 +64,12 @@ type BrowserSpeechRecognition = {
   interimResults: boolean;
   continuous: boolean;
   start: () => void;
+  stop: () => void;
+  abort: () => void;
   onresult: ((event: BrowserSpeechRecognitionResultEvent) => void) | null;
   onerror: ((event: BrowserSpeechRecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
+  onstart: (() => void) | null;
 };
 
 type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
@@ -101,6 +104,7 @@ const EMPTY_CUSTOM_FOOD_DRAFT: CustomFoodDraft = {
 };
 
 export default function LoggerPage() {
+  const [mounted, setMounted] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [transcript, setTranscript] = useState("");
@@ -116,13 +120,26 @@ export default function LoggerPage() {
   const [customFoodDraft, setCustomFoodDraft] = useState<CustomFoodDraft>(EMPTY_CUSTOM_FOOD_DRAFT);
   const [customFoodError, setCustomFoodError] = useState("");
   const [customFoodSuccessMessage, setCustomFoodSuccessMessage] = useState("");
+  const [supportsSpeechRecognition, setSupportsSpeechRecognition] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+
+  // Handle mounting to prevent hydration issues
+  useEffect(() => {
+    setMounted(true);
+    // Check speech support only on client
+    setSupportsSpeechRecognition(
+      typeof window !== "undefined" &&
+      ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)
+    );
+  }, []);
 
   useEffect(() => {
+    if (!mounted) return;
     requireAccessTokenOrRedirect();
-  }, []);
+  }, [mounted]);
 
   useEffect(() => {
     if (!apiData || apiData.results.length === 0) {
@@ -141,10 +158,6 @@ export default function LoggerPage() {
       setEditableFoodDraft(buildEditableFoodDraft(apiData.results[nextIndex]));
     }
   }, [apiData, isEditingMeal, selectedFoodIndex]);
-
-  const supportsSpeechRecognition =
-    typeof window !== "undefined" &&
-    ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
 
   const fetchByQuery = async (queryText: string) => {
     const accessToken = await requireAccessTokenOrRedirect();
@@ -253,13 +266,37 @@ export default function LoggerPage() {
     }
   };
 
+  const stopSpeechRecognition = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+        recognitionRef.current.abort();
+      } catch (e) {
+        // Ignore errors when stopping
+      }
+      recognitionRef.current = null;
+    }
+  };
+
   const handleMicClick = async () => {
-    if (isProcessing) {
+    if (!mounted || isProcessing) {
       return;
     }
 
-    if (!supportsSpeechRecognition && mediaRecorderRef.current && isListening) {
-      mediaRecorderRef.current.stop();
+    // If already listening, stop
+    if (isListening) {
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current.stop();
+      } else {
+        stopSpeechRecognition();
+      }
+      setIsListening(false);
+      return;
+    }
+
+    // Fallback for browsers without Web Speech API
+    if (!supportsSpeechRecognition) {
+      await startMediaRecorderFallback();
       return;
     }
 
@@ -282,12 +319,21 @@ export default function LoggerPage() {
 
     setError("");
     setIsListening(true);
+
+    // Stop any existing recognition
+    stopSpeechRecognition();
+
     const recognition = new SpeechRecognitionConstructor();
+    recognitionRef.current = recognition;
     recognition.lang = "en-US";
     recognition.interimResults = false;
     recognition.continuous = false;
 
     let finalTranscript = "";
+
+    recognition.onstart = () => {
+      setIsListening(true);
+    };
 
     recognition.onresult = (event: BrowserSpeechRecognitionResultEvent) => {
       finalTranscript = event.results[0][0].transcript;
@@ -297,10 +343,12 @@ export default function LoggerPage() {
     recognition.onerror = (event: BrowserSpeechRecognitionErrorEvent) => {
       setError(`Speech error: ${event.error}`);
       setIsListening(false);
+      recognitionRef.current = null;
     };
 
     recognition.onend = async () => {
       setIsListening(false);
+      recognitionRef.current = null;
 
       if (!finalTranscript.trim()) {
         return;
@@ -504,8 +552,13 @@ export default function LoggerPage() {
     }
   };
 
+  // Don't render anything until mounted to prevent hydration mismatch
+  if (!mounted) {
+    return null;
+  }
+
   return (
-    <main className="relative min-h-screen overflow-x-hidden bg-gradient-to-b from-[#0b1220] via-[#0b1220] to-[#07121a] text-white">
+    <main className="relative min-h-screen overflow-x-hidden bg-gradient-to-b from-[#0b1220] via-[#0b1220] to-[#07121a] text-white" suppressHydrationWarning>
       <div className="pointer-events-none absolute inset-0 overflow-hidden">
         <div className="absolute -top-20 left-1/2 h-[520px] w-[520px] -translate-x-1/2 rounded-full bg-emerald-500/15 blur-[140px]" />
         <div className="absolute top-40 left-0 h-[360px] w-[360px] rounded-full bg-sky-500/10 blur-[120px]" />
@@ -654,7 +707,7 @@ export default function LoggerPage() {
                 <p className="text-sm font-medium text-white/80">Transcript</p>
                 <span className="text-xs text-white/50">Preview</span>
               </div>
-              <p className="mt-3 text-base leading-7 text-white/90">{transcript}</p>
+              <p className="mt-3 text-base leading-7 text-white/90">{transcript || "..."}</p>
             </div>
           </div>
 
