@@ -120,7 +120,7 @@ export default function LoggerPage() {
   const [transcript, setTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [isRecognizing, setIsRecognizing] = useState(false);
-  const [persistentTranscript, setPersistentTranscript] = useState(""); // Renamed for clarity
+  const [persistentTranscript, setPersistentTranscript] = useState("");
   const [apiData, setApiData] = useState<SearchResponse | null>(null);
   const [error, setError] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
@@ -292,6 +292,22 @@ export default function LoggerPage() {
     }
   };
 
+  const handleClearMeal = () => {
+    if (isListening || isProcessing) {
+      return; // Don't clear while active
+    }
+    setApiData(null);
+    setPersistentTranscript("");
+    setTranscript("");
+    setInterimTranscript("");
+    setError("");
+    setStatusMessage("");
+    setSelectedFoodIndex(0);
+    setIsEditingMeal(false);
+    setEditableFoodDraft(null);
+    finalTranscriptRef.current = "";
+  };
+
   const handleMicClick = async () => {
     if (!mounted || isProcessing) {
       return;
@@ -307,9 +323,22 @@ export default function LoggerPage() {
       setIsListening(false);
       setIsRecognizing(false);
       setInterimTranscript("");
-      // CRITICAL: Keep persistentTranscript as is - don't clear it
+      // Keep persistentTranscript as is - don't clear it
       return;
     }
+
+    // NEW: Clear all state when starting a NEW recording
+    // This is critical for allowing multiple meals to be logged sequentially
+    setApiData(null);
+    setError("");
+    setStatusMessage("");
+    setInterimTranscript("");
+    setPersistentTranscript("");
+    finalTranscriptRef.current = "";
+    setTranscript("");
+    setSelectedFoodIndex(0);
+    setIsEditingMeal(false);
+    setEditableFoodDraft(null);
 
     // Fallback for browsers without Web Speech API
     if (!supportsSpeechRecognition) {
@@ -337,10 +366,6 @@ export default function LoggerPage() {
     setError("");
     setIsListening(true);
     setIsRecognizing(true);
-    setInterimTranscript("");
-    // Clear persistent transcript when starting a NEW recording
-    setPersistentTranscript("");
-    finalTranscriptRef.current = "";
 
     // Stop any existing recognition
     stopSpeechRecognition();
@@ -830,9 +855,20 @@ export default function LoggerPage() {
             <div className="mt-10 rounded-3xl bg-black/20 p-5 ring-1 ring-white/10">
               <div className="flex items-center justify-between">
                 <p className="text-sm font-medium text-white/80">Transcript</p>
-                <span className="text-xs text-white/50">
-                  {isRecognizing ? "Live" : "Preview"}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-white/50">
+                    {isRecognizing ? "Live" : "Preview"}
+                  </span>
+                  {persistentTranscript && !isListening && !isProcessing && (
+                    <button
+                      onClick={handleClearMeal}
+                      className="text-xs text-white/40 hover:text-white/80 transition"
+                      title="Clear transcript"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="mt-3 text-base leading-7 text-white/90 min-h-[84px]">
                 {getDisplayTranscript()}
