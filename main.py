@@ -1245,7 +1245,7 @@ async def fetch_usda(food_name: str):
         response = await client.post(
             "https://api.nal.usda.gov/fdc/v1/foods/search",
             params={"api_key": USDA_API_KEY},
-            json={"query": food_name, "pageSize": 10, "requireAllWords": False}
+            json={"query": food_name, "pageSize": 5}
         )
 
         if response.status_code != 200:
@@ -1255,25 +1255,12 @@ async def fetch_usda(food_name: str):
         if not foods:
             return None
 
-        selected = select_usda_candidate(food_name, foods)
+        best = select_usda_candidate(food_name, foods)
 
-        lookup = {
-            "Energy": "calories",
-            "Protein": "protein_g",
-            "Carbohydrate, by difference": "carbs_g",
-            "Total lipid (fat)": "fat_g",
-            "Sugars, total including NLEA": "sugar_g",
-            "Fiber, total dietary": "fiber_g",
-            "Vitamin D (D2 + D3), International Units": "vitamin_d_mcg"
+        return {
+            "raw": best,
+            "nutrition": extract_nutrition(best)
         }
-
-        nutrition = {v: "Not Available" for v in lookup.values()}
-
-        for n in selected.get("foodNutrients", []):
-            if n.get("nutrientName") in lookup:
-                nutrition[lookup[n["nutrientName"]]] = n.get("value", "Not Available")
-
-        return nutrition
 
 
 def normalize_food_text(text: str) -> str:
@@ -1588,3 +1575,75 @@ async def process_foods(request: Request, foods, transcript: str | None = None):
         payload["transcript"] = transcript
 
     return payload
+
+async def fetch_food_with_agent(food_name: str, user_id: str | None = None):
+    MAX_ATTEMPTS = 3
+    current_query = food_name
+
+    for attempt in range(MAX_ATTEMPTS):
+
+        # 1️⃣ Personal foods (highest priority)
+        if user_id:
+            personal = await fetch_personal_food(user_id, current_query)
+            if personal:
+                return personal["nutrition"]
+
+        # 2️⃣ USDA search
+        usda_result = await fetch_usda_once(current_query)
+
+        if usda_result:
+            if not is_low_confidence_match(current_query, usda_result["raw"]):
+                return usda_result["nutrition"]
+
+        # 3️⃣ Agent rewrite
+        improved = await resolve_with_agent(current_query)
+
+        if not improved or improved == current_query:
+            break
+
+        current_query = improved
+
+    return await fetch_from_web_agent(food_name)
+
+async def fetch_from_web_agent(food_name: str):
+    try:
+        search_results = tavily.search(
+            query=f"{food_name} calories protein carbs fat per serving",
+            search_depth="advanced",
+            max_results=3
+        )
+
+        content = " ".join([r["content"] for r in search_results["results"]])
+
+        prompt = f"""
+Extract nutrition for: "{food_name}"
+
+Return ONLY JSON:
+{{
+  "calories": number,
+  "protein_g": number,
+  "carbs_g": number,
+  "fat_g": number
+}}
+
+Use reasonable estimates if exact values are unclear.
+
+Text:
+{content}
+"""
+
+        response = safe_groq_call(prompt, "Return only JSON.")
+        data = extract_json(response)
+
+        if data:
+            return data
+
+    except Exception as e:
+        logger.warning("Web agent failed: %s", type(e).__name__)
+
+    return {
+        "calories": 0,
+        "protein_g": 0,
+        "carbs_g": 0,
+        "fat_g": 0
+    }
