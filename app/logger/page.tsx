@@ -418,7 +418,6 @@ export default function LoggerPage() {
 
       // Make sure persistent transcript shows the final text
       setPersistentTranscript(finalTranscript);
-      setStatusMessage("Processing your meal...");
       setIsProcessing(true);
       
       try {
