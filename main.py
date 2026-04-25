@@ -1268,6 +1268,9 @@ async def fetch_usda(food_name: str):
         }
 
         nutrition = {v: "Not Available" for v in lookup.values()}
+        
+        # Store the food description for reliability checking
+        nutrition["food_description"] = selected.get("description", "")
 
         for n in selected.get("foodNutrients", []):
             if n.get("nutrientName") in lookup:
@@ -1287,9 +1290,24 @@ async def fetch_with_tavily(food_name: str) -> dict | None:
         return None
 
     try:
+        # Check if this is a branded restaurant item for better search
+        brand_patterns = [
+            "chipotle", "starbucks", "mcdonald", "wendy", "burger king", 
+            "taco bell", "kfc", "subway", "panera", "chick-fil-a",
+            "dunkin", "papa john", "domino", "pizza hut", "olive garden"
+        ]
+        
+        is_branded = any(brand in food_name.lower() for brand in brand_patterns)
+        
+        if is_branded:
+            search_query = f"{food_name} nutrition facts calories protein carbs fat restaurant official"
+            logger.info(f"Branded item detected, using enhanced search: {search_query}")
+        else:
+            search_query = f"nutrition facts for {food_name} calories protein carbs fat"
+        
         # Search for nutrition info
         search_result = tavily.search(
-            query=f"nutrition facts for {food_name} calories protein carbs fat",
+            query=search_query,
             search_depth="advanced",
             max_results=5
         )
@@ -1304,9 +1322,11 @@ async def fetch_with_tavily(food_name: str) -> dict | None:
             for r in search_result.get("results", [])[:3]
         ])
         
-        # Use Groq to extract structured nutrition data
+        # Use Groq to extract structured nutrition data with brand awareness
         extraction_prompt = f"""
 You are a nutrition data extractor. Extract nutrition information for "{food_name}" from the search results below.
+
+IMPORTANT: If this is a branded restaurant item (like Chipotle, Starbucks, McDonald's, etc.), use the restaurant's official nutrition data if available.
 
 Return ONLY JSON in this exact format (use 0 for missing values):
 {{
@@ -1323,10 +1343,10 @@ Search results:
 {search_content}
 
 Guidelines:
-- Calories should be per serving (typically 100g or standard serving)
-- If multiple values found, use the most common or standard one
+- Calories should be per serving (as listed in the source)
+- If multiple values found, use the most specific to the brand/restaurant
 - Set confidence based on consistency of sources and data quality
-- If no reliable data, return all zeros with confidence "low"
+- For branded restaurant items, prioritize official nutrition data
 
 ONLY RETURN VALID JSON. NO OTHER TEXT.
 """
@@ -1358,8 +1378,8 @@ ONLY RETURN VALID JSON. NO OTHER TEXT.
         return None
 
 
-def is_usda_result_reliable(nutrition: dict) -> bool:
-    """Check if USDA result is reliable or missing key nutrients"""
+def is_usda_result_reliable(nutrition: dict, query: str = "") -> bool:
+    """Check if USDA result is reliable and relevant to the query"""
     if not nutrition:
         return False
     
@@ -1374,11 +1394,32 @@ def is_usda_result_reliable(nutrition: dict) -> bool:
     # Count valid numeric values
     valid_count = sum(1 for v in numeric_values if isinstance(v, (int, float)) and v > 0)
     
-    # If we have at least calories and one macro, it's probably fine
-    # Otherwise, consider it unreliable
+    # If we have at least calories and one macro, continue checking
     calories_ok = isinstance(nutrition.get("calories"), (int, float)) and nutrition.get("calories", 0) > 0
     
-    return calories_ok and valid_count >= 1
+    if not (calories_ok and valid_count >= 1):
+        return False
+    
+    # Check if query contains brand indicators that USDA likely won't have
+    brand_patterns = [
+        "chipotle", "starbucks", "mcdonald", "wendy", "burger king",
+        "taco bell", "kfc", "subway", "panera", "dunkin",
+        "chipotle mexican grill", "chick-fil-a", "in-n-out", "five guys",
+        "panda express", "olive garden", "papa john", "domino", "pizza hut"
+    ]
+    
+    query_lower = query.lower()
+    
+    # If query contains a brand name, USDA results are likely unreliable
+    for brand in brand_patterns:
+        if brand in query_lower:
+            # Check if the nutrition source includes the brand
+            food_desc = str(nutrition.get("food_description", "")).lower()
+            if brand not in food_desc:
+                logger.info(f"Brand '{brand}' detected in query but not in USDA result - marking as unreliable")
+                return False
+    
+    return True
 
 
 def merge_nutrition_data(usda_nutrition: dict, tavily_nutrition: dict) -> dict:
@@ -1414,14 +1455,14 @@ async def fetch_nutrition_with_fallback(food_name: str) -> dict:
     # Step 1: Try USDA
     usda_nutrition = await fetch_usda(food_name)
     
-    # If USDA succeeded and seems reliable, return it
-    if usda_nutrition and is_usda_result_reliable(usda_nutrition):
+    # If USDA succeeded and seems reliable FOR THIS SPECIFIC QUERY, return it
+    if usda_nutrition and is_usda_result_reliable(usda_nutrition, food_name):
         usda_nutrition["source"] = "usda"
         return usda_nutrition
     
     # Step 2: USDA failed or unreliable - try Tavily fallback
     if tavily:
-        logger.info(f"USDA unreliable for '{food_name}', falling back to Tavily agent")
+        logger.info(f"USDA unreliable for '{food_name}' (contains brand or poor match), falling back to Tavily agent")
         tavily_nutrition = await fetch_with_tavily(food_name)
         
         if tavily_nutrition:
@@ -1705,7 +1746,7 @@ async def process_foods_json(foods, user_id: str | None = None):
         else:
             # Use the new fallback-enabled nutrition fetcher
             nutrition_data = await fetch_nutrition_with_fallback(search_query)
-            nutrition = {k: v for k, v in nutrition_data.items() if k != "source" and k != "confidence"}
+            nutrition = {k: v for k, v in nutrition_data.items() if k != "source" and k != "confidence" and k != "food_description"}
             source = nutrition_data.get("source", "usda")
             selected_food_name = food["food"]
 
