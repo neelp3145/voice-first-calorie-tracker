@@ -120,7 +120,7 @@ stt_client = OpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
-tavily = TavilyClient(api_key=TAVILY_API_KEY)
+tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 templates = Jinja2Templates(directory="templates")
 
 
@@ -1275,6 +1275,181 @@ async def fetch_usda(food_name: str):
 
         return nutrition
 
+# ------------------ TAVILY AGENT FALLBACK ------------------
+
+async def fetch_with_tavily(food_name: str) -> dict | None:
+    """
+    Use Tavily search + Groq to extract nutrition info when USDA fails.
+    This acts as an agent-like fallback.
+    """
+    if not tavily:
+        logger.warning("Tavily client not configured, skipping fallback")
+        return None
+
+    try:
+        # Search for nutrition info
+        search_result = tavily.search(
+            query=f"nutrition facts for {food_name} calories protein carbs fat",
+            search_depth="advanced",
+            max_results=5
+        )
+        
+        if not search_result or not search_result.get("results"):
+            logger.info(f"No Tavily results for {food_name}")
+            return None
+        
+        # Extract relevant content from search results
+        search_content = "\n".join([
+            f"Source: {r.get('title', 'Unknown')}\nContent: {r.get('content', '')[:500]}"
+            for r in search_result.get("results", [])[:3]
+        ])
+        
+        # Use Groq to extract structured nutrition data
+        extraction_prompt = f"""
+You are a nutrition data extractor. Extract nutrition information for "{food_name}" from the search results below.
+
+Return ONLY JSON in this exact format (use 0 for missing values):
+{{
+    "calories": number,
+    "protein_g": number,
+    "carbs_g": number,
+    "fat_g": number,
+    "sugar_g": number,
+    "fiber_g": number,
+    "confidence": "high" | "medium" | "low"
+}}
+
+Search results:
+{search_content}
+
+Guidelines:
+- Calories should be per serving (typically 100g or standard serving)
+- If multiple values found, use the most common or standard one
+- Set confidence based on consistency of sources and data quality
+- If no reliable data, return all zeros with confidence "low"
+
+ONLY RETURN VALID JSON. NO OTHER TEXT.
+"""
+        
+        result_text = safe_groq_call(extraction_prompt, "You are a precise nutrition data extractor that returns only JSON.")
+        
+        if not result_text:
+            return None
+        
+        nutrition_data = extract_json(result_text)
+        
+        if nutrition_data and isinstance(nutrition_data, dict):
+            # Ensure all required fields exist
+            return {
+                "calories": nutrition_data.get("calories", 0),
+                "protein_g": nutrition_data.get("protein_g", 0),
+                "carbs_g": nutrition_data.get("carbs_g", 0),
+                "fat_g": nutrition_data.get("fat_g", 0),
+                "sugar_g": nutrition_data.get("sugar_g", 0),
+                "fiber_g": nutrition_data.get("fiber_g", 0),
+                "confidence": nutrition_data.get("confidence", "low"),
+                "source": "tavily"
+            }
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Tavily fetch failed for {food_name}: {str(e)}")
+        return None
+
+
+def is_usda_result_reliable(nutrition: dict) -> bool:
+    """Check if USDA result is reliable or missing key nutrients"""
+    if not nutrition:
+        return False
+    
+    # Check if we got any numeric values
+    numeric_values = [
+        nutrition.get("calories"),
+        nutrition.get("protein_g"),
+        nutrition.get("carbs_g"),
+        nutrition.get("fat_g")
+    ]
+    
+    # Count valid numeric values
+    valid_count = sum(1 for v in numeric_values if isinstance(v, (int, float)) and v > 0)
+    
+    # If we have at least calories and one macro, it's probably fine
+    # Otherwise, consider it unreliable
+    calories_ok = isinstance(nutrition.get("calories"), (int, float)) and nutrition.get("calories", 0) > 0
+    
+    return calories_ok and valid_count >= 1
+
+
+def merge_nutrition_data(usda_nutrition: dict, tavily_nutrition: dict) -> dict:
+    """Merge USDA and Tavily data, preferring USDA for basic macros"""
+    if not tavily_nutrition:
+        return usda_nutrition
+    
+    result = {}
+    
+    # For each nutrient, prefer USDA if it has a valid number, otherwise use Tavily
+    for key in ["calories", "protein_g", "carbs_g", "fat_g", "sugar_g", "fiber_g"]:
+        usda_val = usda_nutrition.get(key) if usda_nutrition else None
+        tavily_val = tavily_nutrition.get(key) if tavily_nutrition else None
+        
+        # Clean USDA value (it might be "Not Available" string)
+        if isinstance(usda_val, (int, float)) and usda_val > 0:
+            result[key] = usda_val
+        elif isinstance(tavily_val, (int, float)) and tavily_val > 0:
+            result[key] = tavily_val
+        else:
+            result[key] = 0
+    
+    return result
+
+
+async def fetch_nutrition_with_fallback(food_name: str) -> dict:
+    """
+    Fetch nutrition data with fallback chain:
+    1. Try USDA first
+    2. If USDA fails or returns unreliable results, try Tavily + Groq
+    3. Return what we have (even if incomplete)
+    """
+    # Step 1: Try USDA
+    usda_nutrition = await fetch_usda(food_name)
+    
+    # If USDA succeeded and seems reliable, return it
+    if usda_nutrition and is_usda_result_reliable(usda_nutrition):
+        usda_nutrition["source"] = "usda"
+        return usda_nutrition
+    
+    # Step 2: USDA failed or unreliable - try Tavily fallback
+    if tavily:
+        logger.info(f"USDA unreliable for '{food_name}', falling back to Tavily agent")
+        tavily_nutrition = await fetch_with_tavily(food_name)
+        
+        if tavily_nutrition:
+            # Merge data, preferring USDA's reliable values over Tavily
+            merged = merge_nutrition_data(usda_nutrition, tavily_nutrition)
+            merged["source"] = "tavily_fallback"
+            merged["confidence"] = tavily_nutrition.get("confidence", "low")
+            logger.info(f"Tavily fallback succeeded for '{food_name}'")
+            return merged
+    
+    # Step 3: Return whatever USDA gave us (even if partial)
+    if usda_nutrition:
+        usda_nutrition["source"] = "usda_partial"
+        return usda_nutrition
+    
+    # Step 4: Complete failure - return empty nutrition
+    logger.warning(f"All nutrition sources failed for '{food_name}'")
+    return {
+        "calories": 0,
+        "protein_g": 0,
+        "carbs_g": 0,
+        "fat_g": 0,
+        "sugar_g": 0,
+        "fiber_g": 0,
+        "vitamin_d_mcg": 0,
+        "source": "none"
+    }
+
 
 def normalize_food_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
@@ -1528,8 +1703,10 @@ async def process_foods_json(foods, user_id: str | None = None):
             source = personal_food["source"]
             selected_food_name = personal_food["food"]
         else:
-            nutrition = await fetch_usda(search_query) or {}
-            source = "USDA"
+            # Use the new fallback-enabled nutrition fetcher
+            nutrition_data = await fetch_nutrition_with_fallback(search_query)
+            nutrition = {k: v for k, v in nutrition_data.items() if k != "source" and k != "confidence"}
+            source = nutrition_data.get("source", "usda")
             selected_food_name = food["food"]
 
         for k in totals:
