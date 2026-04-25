@@ -51,8 +51,16 @@ type CustomFoodDraft = {
   fat: string;
 };
 
+// Fixed: Each result item has a transcript and an isFinal property
+type SpeechRecognitionResult = {
+  transcript: string;
+  isFinal?: boolean;
+};
+
+type SpeechRecognitionResultList = ArrayLike<ArrayLike<SpeechRecognitionResult>>;
+
 type BrowserSpeechRecognitionResultEvent = {
-  results: ArrayLike<ArrayLike<{ transcript: string }>>;
+  results: SpeechRecognitionResultList;
   resultIndex: number;
 };
 
@@ -347,6 +355,7 @@ export default function LoggerPage() {
       setStatusMessage("Listening... speak now");
     };
 
+    // Fixed: Properly handle speech recognition results with isFinal property
     recognition.onresult = (event: BrowserSpeechRecognitionResultEvent) => {
       let interim = "";
       let final = "";
@@ -354,9 +363,14 @@ export default function LoggerPage() {
       // Process all results
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
-        const transcriptText = result[0].transcript;
+        // Get the first alternative (the most likely transcript)
+        const alternative = result[0];
+        const transcriptText = alternative.transcript;
         
-        if (result.isFinal) {
+        // Check if this result is final using the isFinal property on the result
+        const isFinalResult = (result as any).isFinal === true;
+        
+        if (isFinalResult) {
           final += transcriptText + " ";
           finalTranscriptRef.current += transcriptText + " ";
         } else {
