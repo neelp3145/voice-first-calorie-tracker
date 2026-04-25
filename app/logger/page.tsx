@@ -120,7 +120,7 @@ export default function LoggerPage() {
   const [transcript, setTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [isRecognizing, setIsRecognizing] = useState(false);
-  const [displayTranscript, setDisplayTranscript] = useState(""); // NEW: Persistent transcript display
+  const [persistentTranscript, setPersistentTranscript] = useState(""); // Renamed for clarity
   const [apiData, setApiData] = useState<SearchResponse | null>(null);
   const [error, setError] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
@@ -220,8 +220,7 @@ export default function LoggerPage() {
     }
 
     const data: VoiceResponse = await response.json();
-    setTranscript(data.transcript || "");
-    setDisplayTranscript(data.transcript || ""); // Update display transcript
+    setPersistentTranscript(data.transcript || "");
     setApiData({ query: data.query, results: data.results, totals: data.totals });
     setSelectedFoodIndex(0);
     setIsEditingMeal(false);
@@ -308,7 +307,7 @@ export default function LoggerPage() {
       setIsListening(false);
       setIsRecognizing(false);
       setInterimTranscript("");
-      // Don't clear displayTranscript - keep showing what was recognized so far
+      // CRITICAL: Keep persistentTranscript as is - don't clear it
       return;
     }
 
@@ -339,10 +338,9 @@ export default function LoggerPage() {
     setIsListening(true);
     setIsRecognizing(true);
     setInterimTranscript("");
-    // Clear the accumulated final transcript when starting new recording
-    setDisplayTranscript("");
+    // Clear persistent transcript when starting a NEW recording
+    setPersistentTranscript("");
     finalTranscriptRef.current = "";
-    setTranscript("");
 
     // Stop any existing recognition
     stopSpeechRecognition();
@@ -360,7 +358,6 @@ export default function LoggerPage() {
       setStatusMessage("Listening... speak now");
     };
 
-    // Fixed: Properly handle speech recognition results with isFinal property
     recognition.onresult = (event: BrowserSpeechRecognitionResultEvent) => {
       let interim = "";
       let final = "";
@@ -368,29 +365,22 @@ export default function LoggerPage() {
       // Process all results
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
-        // Get the first alternative (the most likely transcript)
         const alternative = result[0];
         const transcriptText = alternative.transcript;
         
-        // Check if this result is final using the isFinal property on the result
         const isFinalResult = (result as any).isFinal === true;
         
         if (isFinalResult) {
           final += transcriptText + " ";
           finalTranscriptRef.current += transcriptText + " ";
+          // Update persistent transcript immediately when we get final text
+          setPersistentTranscript(finalTranscriptRef.current.trim());
         } else {
           interim += transcriptText;
         }
       }
 
       // Update UI with live transcription
-      if (final) {
-        const newFinal = final.trim();
-        setTranscript(newFinal);
-        // Update displayTranscript with final text (keeps it even after stopping)
-        setDisplayTranscript(newFinal);
-      }
-      
       if (interim) {
         setInterimTranscript(interim);
         setStatusMessage("Recognizing... (keep speaking)");
@@ -415,8 +405,8 @@ export default function LoggerPage() {
       setIsListening(false);
       setIsRecognizing(false);
       
-      // Use the stored displayTranscript instead of clearing it
-      const finalTranscript = displayTranscript || finalTranscriptRef.current.trim();
+      // Use persistentTranscript which we've been updating throughout
+      const finalTranscript = persistentTranscript || finalTranscriptRef.current.trim();
       
       // Don't process if empty
       if (!finalTranscript) {
@@ -426,7 +416,8 @@ export default function LoggerPage() {
         return;
       }
 
-      // Keep the transcript visible
+      // Make sure persistent transcript shows the final text
+      setPersistentTranscript(finalTranscript);
       setStatusMessage("Processing your meal...");
       setIsProcessing(true);
       
@@ -632,8 +623,9 @@ export default function LoggerPage() {
   };
 
   const getDisplayTranscript = () => {
+    // Show live transcription while actively speaking
     if (interimTranscript && !isProcessing && isRecognizing) {
-      const finalPart = displayTranscript || "";
+      const finalPart = persistentTranscript || "";
       return (
         <span>
           {finalPart}
@@ -644,8 +636,14 @@ export default function LoggerPage() {
       );
     }
     
-    if (displayTranscript && !isProcessing) {
-      return displayTranscript;
+    // Show persistent transcript when not actively speaking
+    if (persistentTranscript && !isProcessing) {
+      return persistentTranscript;
+    }
+    
+    // Show processing state
+    if (isProcessing && persistentTranscript) {
+      return persistentTranscript;
     }
     
     return "...";
