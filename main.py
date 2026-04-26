@@ -1289,9 +1289,23 @@ def normalize_portion_size(food_name: str, nutrition: dict) -> dict:
     
     food_lower = food_name.lower()
     
+    # IMPORTANT: For eggs, force correct values regardless of USDA
+    # One large egg = ~50g, 70-80 calories
+    if "egg" in food_lower.split():  # Check exact word match
+        logger.info(f"Forcing correct egg nutrition values for '{food_name}'")
+        return {
+            "calories": 72.0,
+            "protein_g": 6.3,
+            "carbs_g": 0.5,
+            "fat_g": 4.8,
+            "sugar_g": 0.2,
+            "fiber_g": 0,
+            "vitamin_d_mcg": 1.0,
+            "food_description": "Egg, whole, large",
+        }
+    
     # Define typical portion sizes (grams per typical serving)
     portion_rules = [
-        (["egg", "eggs"], 50),
         (["chicken breast"], 150),
         (["chicken thigh"], 120),
         (["chicken leg"], 120),
@@ -1463,6 +1477,15 @@ def is_usda_result_reliable(nutrition: dict, query: str = "") -> bool:
     if not nutrition:
         return False
     
+    # Special case: eggs are often wrong in USDA
+    query_lower = query.lower()
+    if "egg" in query_lower.split():
+        calories = nutrition.get("calories", 0)
+        # Real egg is ~70-80 calories, USDA often returns 150-600+ which is wrong
+        if calories > 100:
+            logger.info(f"Egg detected with {calories} calories - marking as unreliable (should be ~72)")
+            return False
+    
     numeric_values = [
         nutrition.get("calories"),
         nutrition.get("protein_g"),
@@ -1481,8 +1504,6 @@ def is_usda_result_reliable(nutrition: dict, query: str = "") -> bool:
         "taco bell", "kfc", "subway", "panera", "dunkin",
         "chick-fil-a", "in-n-out", "five guys", "panda express", "olive garden"
     ]
-    
-    query_lower = query.lower()
     
     for brand in brand_patterns:
         if brand in query_lower:
