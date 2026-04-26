@@ -1549,7 +1549,7 @@ async def fetch_nutrition_agent(food_name: str) -> dict:
     """
     Clean agent pipeline:
     1. Try USDA
-    2. If weak/unreliable → Tavily agent
+    2. If weak/unreliable --> Tavily agent
     3. Return best source (NO merging)
     """
 
