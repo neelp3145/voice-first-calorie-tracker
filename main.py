@@ -1240,6 +1240,82 @@ async def extract_foods_with_ai(query: str):
 
 # ------------------ USDA ------------------
 
+def normalize_portion_size(food_name: str, nutrition: dict) -> dict:
+    """
+    Normalize nutrition values to typical serving sizes.
+    USDA returns data per 100g, but users expect per-item values.
+    """
+    if not nutrition:
+        return nutrition
+    
+    food_lower = food_name.lower()
+    
+    # Define typical portion sizes (grams per typical serving)
+    # Format: (keywords list, grams_per_typical_serving)
+    portion_rules = [
+        # Eggs - one large egg is ~50g
+        (["egg", "eggs"], 50),
+        
+        # Chicken breast - typical serving is ~150g
+        (["chicken breast"], 150),
+        (["chicken thigh"], 120),
+        (["chicken leg"], 120),
+        
+        # Beef
+        (["steak"], 150),
+        (["burger patty"], 113),  # Quarter pounder is 113g
+        
+        # Bread
+        (["toast", "slice of bread", "piece of bread"], 35),
+        (["bread slice"], 35),
+        
+        # Fruits
+        (["apple"], 150),
+        (["banana"], 120),
+        (["orange"], 130),
+        
+        # Vegetables
+        (["carrot"], 61),
+        (["broccoli"], 85),
+        
+        # Dairy
+        (["cheese slice"], 20),
+        (["yogurt cup"], 150),
+        
+        # Rice and grains
+        (["rice cooked"], 150),
+        (["pasta cooked"], 150),
+        
+        # Nuts
+        (["almond"], 1.5),  # Per almond
+        (["walnut"], 4),     # Per walnut half
+        
+        # Fast food items (keep as-is, they're already per item)
+        (["chipotle burrito", "mcdonald", "burger king", "taco bell"], 100),  # No adjustment needed
+    ]
+    
+    # Check if the food matches any portion rule
+    for keywords, grams_per_serving in portion_rules:
+        if any(keyword in food_lower for keyword in keywords):
+            # USDA data is per 100g, so:
+            # nutrition_per_gram = nutrition_value / 100
+            # nutrition_per_serving = nutrition_per_gram * grams_per_serving
+            multiplier = grams_per_serving / 100
+            
+            # Apply multiplier to all numeric nutrition values
+            adjusted_nutrition = {}
+            for key, value in nutrition.items():
+                if isinstance(value, (int, float)) and key not in ["food_description", "source", "confidence"]:
+                    adjusted_nutrition[key] = round(value * multiplier, 2)
+                else:
+                    adjusted_nutrition[key] = value
+            
+            logger.info(f"Normalized '{food_name}': applied multiplier {multiplier:.2f} (based on {grams_per_serving}g serving)")
+            return adjusted_nutrition
+    
+    return nutrition
+
+
 async def fetch_usda(food_name: str):
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -1455,6 +1531,10 @@ async def fetch_nutrition_with_fallback(food_name: str) -> dict:
     # Step 1: Try USDA
     usda_nutrition = await fetch_usda(food_name)
     
+    # Apply portion normalization to USDA results
+    if usda_nutrition:
+        usda_nutrition = normalize_portion_size(food_name, usda_nutrition)
+    
     # If USDA succeeded and seems reliable FOR THIS SPECIFIC QUERY, return it
     if usda_nutrition and is_usda_result_reliable(usda_nutrition, food_name):
         usda_nutrition["source"] = "usda"
@@ -1466,6 +1546,9 @@ async def fetch_nutrition_with_fallback(food_name: str) -> dict:
         tavily_nutrition = await fetch_with_tavily(food_name)
         
         if tavily_nutrition:
+            # Apply portion normalization to Tavily results too
+            tavily_nutrition = normalize_portion_size(food_name, tavily_nutrition)
+            
             # Merge data, preferring USDA's reliable values over Tavily
             merged = merge_nutrition_data(usda_nutrition, tavily_nutrition)
             merged["source"] = "tavily_fallback"
