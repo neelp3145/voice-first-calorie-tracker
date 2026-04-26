@@ -369,8 +369,8 @@ CORE PRINCIPLE
 
 You must decide whether the input represents:
 
-- ONE dish → return a single "dish"
-- MULTIPLE foods → return a list
+- ONE dish -> return a single "dish"
+- MULTIPLE foods -> return a list
 
 DO NOT default to a single dish blindly.
 Use reasoning based on food structure.
@@ -400,7 +400,7 @@ Return a LIST if ANY of the following are true:
    - eggs and bacon and toast
 
 3. ITEMS THAT COULD BE ORDERED SEPARATELY:
-   - burger, fries, soda → separate
+   - burger, fries, soda -> separate
 
 4. EXPLICIT QUANTITIES ON DIFFERENT ITEMS:
    - 2 eggs and 1 cup milk
@@ -425,13 +425,13 @@ Return ONE "dish" ONLY if:
 IMPORTANT DISTINCTION
 -----------------------------------
 
-"burger with fries" → SINGLE DISH  
-"pasta with grilled cheese and coke" → MULTIPLE FOODS
+"burger with fries" -> SINGLE DISH  
+"pasta with grilled cheese and coke" -> MULTIPLE FOODS
 
 Why?
 
-- Fries are a typical side → same dish  
-- Grilled cheese + coke → separate items
+- Fries are a typical side -> same dish  
+- Grilled cheese + coke -> separate items
 
 -----------------------------------
 BRANDED / PACKAGED PRODUCT RULES
@@ -440,11 +440,11 @@ BRANDED / PACKAGED PRODUCT RULES
 If the input names a brand or packaged product, preserve that intent.
 
 Examples:
-- "maggi" → branded_product
-- "coke" → branded_product
-- "oreo" → branded_product
-- "lays" → branded_product
-- "pepsi" → branded_product
+- "maggi" -> branded_product
+- "coke" -> branded_product
+- "oreo" -> branded_product
+- "lays" -> branded_product
+- "pepsi" -> branded_product
 
 Rules:
 - Keep the exact brand/product wording in the food text whenever a packaged item is intended.
@@ -461,8 +461,8 @@ PARSING RULES
 -----------------------------------
 
 1. QUANTITIES
-- Convert number words to numbers (one → 1, two → 2)
-- "a/an" → 1
+- Convert number words to numbers (one -> 1, two -> 2)
+- "a/an" -> 1
 - Only apply quantities to individual foods
 - NEVER assign quantity to "dish"
 
@@ -472,8 +472,8 @@ PARSING RULES
 
 3. FOOD NORMALIZATION
 - Simplify:
-  "scrambled eggs" → "egg"
-  "a glass of milk" → "milk"
+  "scrambled eggs" -> "egg"
+  "a glass of milk" -> "milk"
 
 4. DISH PRESERVATION
 - Keep full dish description intact
@@ -497,14 +497,14 @@ EDGE CASE RULES
 - Do NOT assume single dish
 
 2. DRINKS
-- If paired with food → usually separate item
-- Example: "pasta and coke" → split
+- If paired with food -> usually separate item
+- Example: "pasta and coke" -> split
 
 3. "WITH"
 - Sometimes same dish, sometimes not
 - Decide based on food type:
-   - ingredients → same dish
-   - separate foods → split
+   - ingredients -> same dish
+   - separate foods -> split
 
 -----------------------------------
 FEW-SHOT EXAMPLES
@@ -1189,12 +1189,12 @@ Rules:
 - "a", "an" = 1
 - "one" = 1, "two" = 2, etc.
 - "half" = 0.5
-- If nothing specified → 1
+- If nothing specified -> 1
 
 Examples:
-"one bowl pasta" → 1
-"2 slices pizza" → 2
-"half plate rice" → 0.5
+"one bowl pasta" -> 1
+"2 slices pizza" -> 2
+"half plate rice" -> 0.5
 """)
         data = extract_json(result)
         return float(data.get("quantity", 1))
@@ -1251,58 +1251,32 @@ def normalize_portion_size(food_name: str, nutrition: dict) -> dict:
     food_lower = food_name.lower()
     
     # Define typical portion sizes (grams per typical serving)
-    # Format: (keywords list, grams_per_typical_serving)
     portion_rules = [
-        # Eggs - one large egg is ~50g
         (["egg", "eggs"], 50),
-        
-        # Chicken breast - typical serving is ~150g
         (["chicken breast"], 150),
         (["chicken thigh"], 120),
         (["chicken leg"], 120),
-        
-        # Beef
         (["steak"], 150),
-        (["burger patty"], 113),  # Quarter pounder is 113g
-        
-        # Bread
+        (["burger patty"], 113),
         (["toast", "slice of bread", "piece of bread"], 35),
         (["bread slice"], 35),
-        
-        # Fruits
         (["apple"], 150),
         (["banana"], 120),
         (["orange"], 130),
-        
-        # Vegetables
         (["carrot"], 61),
         (["broccoli"], 85),
-        
-        # Dairy
         (["cheese slice"], 20),
         (["yogurt cup"], 150),
-        
-        # Rice and grains
         (["rice cooked"], 150),
         (["pasta cooked"], 150),
-        
-        # Nuts
-        (["almond"], 1.5),  # Per almond
-        (["walnut"], 4),     # Per walnut half
-        
-        # Fast food items (keep as-is, they're already per item)
-        (["chipotle burrito", "mcdonald", "burger king", "taco bell"], 100),  # No adjustment needed
+        (["almond"], 1.5),
+        (["walnut"], 4),
     ]
     
-    # Check if the food matches any portion rule
     for keywords, grams_per_serving in portion_rules:
         if any(keyword in food_lower for keyword in keywords):
-            # USDA data is per 100g, so:
-            # nutrition_per_gram = nutrition_value / 100
-            # nutrition_per_serving = nutrition_per_gram * grams_per_serving
             multiplier = grams_per_serving / 100
             
-            # Apply multiplier to all numeric nutrition values
             adjusted_nutrition = {}
             for key, value in nutrition.items():
                 if isinstance(value, (int, float)) and key not in ["food_description", "source", "confidence"]:
@@ -1310,7 +1284,7 @@ def normalize_portion_size(food_name: str, nutrition: dict) -> dict:
                 else:
                     adjusted_nutrition[key] = value
             
-            logger.info(f"Normalized '{food_name}': applied multiplier {multiplier:.2f} (based on {grams_per_serving}g serving)")
+            logger.info(f"Normalized '{food_name}': applied multiplier {multiplier:.2f}")
             return adjusted_nutrition
     
     return nutrition
@@ -1343,14 +1317,12 @@ async def fetch_usda(food_name: str):
             "Vitamin D (D2 + D3), International Units": "vitamin_d_mcg"
         }
 
-        nutrition = {v: "Not Available" for v in lookup.values()}
-        
-        # Store the food description for reliability checking
+        nutrition = {v: 0 for v in lookup.values()}
         nutrition["food_description"] = selected.get("description", "")
 
         for n in selected.get("foodNutrients", []):
             if n.get("nutrientName") in lookup:
-                nutrition[lookup[n["nutrientName"]]] = n.get("value", "Not Available")
+                nutrition[lookup[n["nutrientName"]]] = n.get("value", 0)
 
         return nutrition
 
@@ -1359,14 +1331,12 @@ async def fetch_usda(food_name: str):
 async def fetch_with_tavily(food_name: str) -> dict | None:
     """
     Use Tavily search + Groq to extract nutrition info when USDA fails.
-    This acts as an agent-like fallback.
     """
     if not tavily:
         logger.warning("Tavily client not configured, skipping fallback")
         return None
 
     try:
-        # Check if this is a branded restaurant item for better search
         brand_patterns = [
             "chipotle", "starbucks", "mcdonald", "wendy", "burger king", 
             "taco bell", "kfc", "subway", "panera", "chick-fil-a",
@@ -1377,11 +1347,10 @@ async def fetch_with_tavily(food_name: str) -> dict | None:
         
         if is_branded:
             search_query = f"{food_name} nutrition facts calories protein carbs fat restaurant official"
-            logger.info(f"Branded item detected, using enhanced search: {search_query}")
+            logger.info(f"Branded item detected: {search_query}")
         else:
             search_query = f"nutrition facts for {food_name} calories protein carbs fat"
         
-        # Search for nutrition info
         search_result = tavily.search(
             query=search_query,
             search_depth="advanced",
@@ -1392,41 +1361,15 @@ async def fetch_with_tavily(food_name: str) -> dict | None:
             logger.info(f"No Tavily results for {food_name}")
             return None
         
-        # Extract relevant content from search results
         search_content = "\n".join([
             f"Source: {r.get('title', 'Unknown')}\nContent: {r.get('content', '')[:500]}"
             for r in search_result.get("results", [])[:3]
         ])
         
         extraction_prompt = f"""
-You are a nutrition agent.
+You are a nutrition data extractor. Extract nutrition information for "{food_name}" from the search results below.
 
-Your job:
-1. Read multiple sources
-2. Resolve conflicts
-3. Return the MOST ACCURATE nutrition data
-
-Food: "{food_name}"
-
-Return ONLY JSON:
-{{
-    "calories": number,
-    "protein_g": number,
-    "carbs_g": number,
-    "fat_g": number,
-    "confidence": "high" | "medium" | "low"
-}}
-
-Rules:
-- Prefer official restaurant or brand data
-- Ignore inconsistent sources
-- If unsure → lower confidence
-
-Sources:
-{search_content}
-"""
-
-IMPORTANT: If this is a branded restaurant item (like Chipotle, Starbucks, McDonald's, etc.), use the restaurant's official nutrition data if available.
+IMPORTANT: If this is a branded restaurant item, use the restaurant's official nutrition data.
 
 Return ONLY JSON in this exact format (use 0 for missing values):
 {{
@@ -1443,10 +1386,9 @@ Search results:
 {search_content}
 
 Guidelines:
-- Calories should be per serving (as listed in the source)
+- Calories should be per serving as listed in the source
 - If multiple values found, use the most specific to the brand/restaurant
-- Set confidence based on consistency of sources and data quality
-- For branded restaurant items, prioritize official nutrition data
+- Set confidence based on consistency of sources
 
 ONLY RETURN VALID JSON. NO OTHER TEXT.
 """
@@ -1459,7 +1401,6 @@ ONLY RETURN VALID JSON. NO OTHER TEXT.
         nutrition_data = extract_json(result_text)
         
         if nutrition_data and isinstance(nutrition_data, dict):
-            # Ensure all required fields exist
             return {
                 "calories": nutrition_data.get("calories", 0),
                 "protein_g": nutrition_data.get("protein_g", 0),
@@ -1483,7 +1424,6 @@ def is_usda_result_reliable(nutrition: dict, query: str = "") -> bool:
     if not nutrition:
         return False
     
-    # Check if we got any numeric values
     numeric_values = [
         nutrition.get("calories"),
         nutrition.get("protein_g"),
@@ -1491,71 +1431,39 @@ def is_usda_result_reliable(nutrition: dict, query: str = "") -> bool:
         nutrition.get("fat_g")
     ]
     
-    # Count valid numeric values
     valid_count = sum(1 for v in numeric_values if isinstance(v, (int, float)) and v > 0)
-    
-    # If we have at least calories and one macro, continue checking
     calories_ok = isinstance(nutrition.get("calories"), (int, float)) and nutrition.get("calories", 0) > 0
     
     if not (calories_ok and valid_count >= 1):
         return False
     
-    # Check if query contains brand indicators that USDA likely won't have
     brand_patterns = [
         "chipotle", "starbucks", "mcdonald", "wendy", "burger king",
         "taco bell", "kfc", "subway", "panera", "dunkin",
-        "chipotle mexican grill", "chick-fil-a", "in-n-out", "five guys",
-        "panda express", "olive garden", "papa john", "domino", "pizza hut"
+        "chick-fil-a", "in-n-out", "five guys", "panda express", "olive garden"
     ]
     
     query_lower = query.lower()
     
-    # If query contains a brand name, USDA results are likely unreliable
     for brand in brand_patterns:
         if brand in query_lower:
-            # Check if the nutrition source includes the brand
             food_desc = str(nutrition.get("food_description", "")).lower()
             if brand not in food_desc:
-                logger.info(f"Brand '{brand}' detected in query but not in USDA result - marking as unreliable")
+                logger.info(f"Brand '{brand}' detected but not in USDA result - marking unreliable")
                 return False
     
     return True
 
 
-def merge_nutrition_data(usda_nutrition: dict, tavily_nutrition: dict) -> dict:
-    """Merge USDA and Tavily data, preferring USDA for basic macros"""
-    if not tavily_nutrition:
-        return usda_nutrition
-    
-    result = {}
-    
-    # For each nutrient, prefer USDA if it has a valid number, otherwise use Tavily
-    for key in ["calories", "protein_g", "carbs_g", "fat_g", "sugar_g", "fiber_g"]:
-        usda_val = usda_nutrition.get(key) if usda_nutrition else None
-        tavily_val = tavily_nutrition.get(key) if tavily_nutrition else None
-        
-        # Clean USDA value (it might be "Not Available" string)
-        if isinstance(usda_val, (int, float)) and usda_val > 0:
-            result[key] = usda_val
-        elif isinstance(tavily_val, (int, float)) and tavily_val > 0:
-            result[key] = tavily_val
-        else:
-            result[key] = 0
-    
-    return result
-
-
 async def fetch_nutrition_agent(food_name: str) -> dict:
     """
-    Clean agent pipeline:
+    Agent pipeline:
     1. Try USDA
-    2. If weak/unreliable --> Tavily agent
-    3. Return best source (NO merging)
+    2. If weak/unreliable -> Tavily agent
+    3. Return best source
     """
-
-    # ---- STEP 1: USDA ----
+    # Step 1: USDA
     usda = await fetch_usda(food_name)
-
     if usda:
         usda = normalize_portion_size(food_name, usda)
 
@@ -1566,19 +1474,17 @@ async def fetch_nutrition_agent(food_name: str) -> dict:
             "confidence": "high"
         }
 
-    # ---- STEP 2: Tavily Agent ----
+    # Step 2: Tavily Agent
     if tavily:
         tavily_data = await fetch_with_tavily(food_name)
-
         if tavily_data:
             tavily_data = normalize_portion_size(food_name, tavily_data)
-
             return {
                 **tavily_data,
                 "source": "Tavily AI Agent"
             }
 
-    # ---- STEP 3: Fallback ----
+    # Step 3: Fallback
     if usda:
         return {
             **usda,
@@ -1591,6 +1497,8 @@ async def fetch_nutrition_agent(food_name: str) -> dict:
         "protein_g": 0,
         "carbs_g": 0,
         "fat_g": 0,
+        "sugar_g": 0,
+        "fiber_g": 0,
         "source": "none",
         "confidence": "none"
     }
@@ -1700,23 +1608,9 @@ def is_brand_like_query(query: str) -> bool:
         return False
 
     brand_terms = {
-        "maggi",
-        "oreo",
-        "coke",
-        "pepsi",
-        "lays",
-        "kitkat",
-        "kelloggs",
-        "kellogg",
-        "nestle",
-        "nutella",
-        "doritos",
-        "pringles",
-        "fanta",
-        "sprite",
-        "snickers",
-        "twix",
-        "maggi",
+        "maggi", "oreo", "coke", "pepsi", "lays", "kitkat",
+        "kelloggs", "kellogg", "nestle", "nutella", "doritos",
+        "pringles", "fanta", "sprite", "snickers", "twix"
     }
 
     return len(tokens) <= 3 or any(token in brand_terms for token in tokens)
@@ -1809,7 +1703,6 @@ def select_usda_candidate_with_ai(query: str, foods: list[dict]) -> int | None:
         "Choose the single best USDA food candidate for the user's intended food. "
         "The input may be a brand-only or packaged-product query. Prefer the packaged product the user most likely means, "
         "not a loose ingredient, seasoning, condiment, or pantry base, unless the query clearly asks for that. "
-        "Short-hand branded foods like coke, oreo, lays, maggi, pepsi, and similar packaged items should resolve to the branded product intent. "
         "Return only JSON in the form {\"selected_index\": number}.\n\n"
         f"User query: {query}\n"
         f"Candidates: {json.dumps(payload, ensure_ascii=False)}"
@@ -1848,9 +1741,8 @@ async def process_foods_json(foods, user_id: str | None = None):
             source = personal_food["source"]
             selected_food_name = personal_food["food"]
         else:
-            # Use the new fallback-enabled nutrition fetcher
             nutrition_data = await fetch_nutrition_agent(search_query)
-            nutrition = {k: v for k, v in nutrition_data.items() if k != "source" and k != "confidence" and k != "food_description"}
+            nutrition = {k: v for k, v in nutrition_data.items() if k not in ["source", "confidence", "food_description"]}
             source = nutrition_data.get("source", "usda")
             selected_food_name = food["food"]
 
