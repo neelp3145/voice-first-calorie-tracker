@@ -1524,7 +1524,7 @@ async def fetch_nutrition_agent(food_name: str) -> dict:
         if action == "accept_usda" and state["usda"]:
             return {
                 **state["usda"],
-                "source": "usda_agent",
+                "source": "USDA",
                 "confidence": "high"
             }
 
@@ -1537,7 +1537,7 @@ async def fetch_nutrition_agent(food_name: str) -> dict:
 
                     return {
                         **tavily_data,
-                        "source": "tavily_agent"
+                        "source": "Tavily AI Agent"
                     }
 
         elif action == "fallback":
