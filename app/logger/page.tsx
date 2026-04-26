@@ -292,10 +292,7 @@ export default function LoggerPage() {
     }
   };
 
-  const handleClearMeal = () => {
-    if (isListening || isProcessing) {
-      return; // Don't clear while active
-    }
+  const resetAllState = () => {
     setApiData(null);
     setPersistentTranscript("");
     setTranscript("");
@@ -306,10 +303,20 @@ export default function LoggerPage() {
     setIsEditingMeal(false);
     setEditableFoodDraft(null);
     finalTranscriptRef.current = "";
+    setIsListening(false);
+    setIsRecognizing(false);
+    setIsProcessing(false);
+  };
+
+  const handleClearMeal = () => {
+    if (isListening || isProcessing) {
+      return; // Don't clear while active
+    }
+    resetAllState();
   };
 
   const handleMicClick = async () => {
-    if (!mounted || isProcessing) {
+    if (!mounted) {
       return;
     }
 
@@ -327,18 +334,13 @@ export default function LoggerPage() {
       return;
     }
 
-    // NEW: Clear all state when starting a NEW recording
-    // This is critical for allowing multiple meals to be logged sequentially
-    setApiData(null);
-    setError("");
-    setStatusMessage("");
-    setInterimTranscript("");
-    setPersistentTranscript("");
-    finalTranscriptRef.current = "";
-    setTranscript("");
-    setSelectedFoodIndex(0);
-    setIsEditingMeal(false);
-    setEditableFoodDraft(null);
+    // If processing, don't allow new recording
+    if (isProcessing) {
+      return;
+    }
+
+    // NEW: Reset ALL state when starting a new recording
+    resetAllState();
 
     // Fallback for browsers without Web Speech API
     if (!supportsSpeechRecognition) {
