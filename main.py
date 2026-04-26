@@ -1141,6 +1141,45 @@ def safe_groq_call(user_prompt: str, system_prompt: str):
         logger.warning("Groq call failed: %s", type(e).__name__)
         return None
 
+def agent_decide_next_step(food_name: str, usda_data: dict | None) -> dict:
+    """
+    LLM decides what to do next:
+    - accept_usda
+    - search_tavily
+    - fallback
+    """
+
+    prompt = f"""
+You are a nutrition decision agent.
+
+Food: {food_name}
+
+USDA Data:
+{json.dumps(usda_data, indent=2) if usda_data else "None"}
+
+Decide the next action.
+
+Return ONLY JSON:
+{{
+  "action": "accept_usda" | "search_tavily" | "fallback",
+  "reason": "short explanation"
+}}
+
+Rules:
+- If USDA has good calories + macros → accept_usda
+- If branded food but USDA looks generic → search_tavily
+- If data missing or zero → search_tavily
+- If nothing works → fallback
+"""
+
+    text = safe_groq_call(prompt, "You are a strict decision-making AI that returns only JSON.")
+    data = extract_json(text)
+
+    if not data or "action" not in data:
+        return {"action": "fallback", "reason": "invalid decision"}
+
+    return data
+
 
 def extract_json(text):
     try:
@@ -1457,38 +1496,58 @@ def is_usda_result_reliable(nutrition: dict, query: str = "") -> bool:
 
 async def fetch_nutrition_agent(food_name: str) -> dict:
     """
-    Agent pipeline:
-    1. Try USDA
-    2. If weak/unreliable -> Tavily agent
-    3. Return best source
+    TRUE AGENT LOOP:
+    think → act → observe → think
     """
-    # Step 1: USDA
-    usda = await fetch_usda(food_name)
-    if usda:
-        usda = normalize_portion_size(food_name, usda)
 
-    if usda and is_usda_result_reliable(usda, food_name):
-        return {
-            **usda,
-            "source": "usda",
-            "confidence": "high"
-        }
+    state = {
+        "food": food_name,
+        "usda": None,
+        "tavily": None,
+    }
 
-    # Step 2: Tavily Agent
-    if tavily:
-        tavily_data = await fetch_with_tavily(food_name)
-        if tavily_data:
-            tavily_data = normalize_portion_size(food_name, tavily_data)
+    for step in range(3):  # limit steps to avoid infinite loops
+        # Step 1: Try USDA if not already done
+        if state["usda"] is None:
+            usda = await fetch_usda(food_name)
+            if usda:
+                usda = normalize_portion_size(food_name, usda)
+            state["usda"] = usda
+
+        # Step 2: Agent decides what to do
+        decision = agent_decide_next_step(food_name, state["usda"])
+        action = decision.get("action")
+
+        logger.info(f"[AGENT] Step {step} → {action} ({decision.get('reason')})")
+
+        # Step 3: Execute action
+        if action == "accept_usda" and state["usda"]:
             return {
-                **tavily_data,
-                "source": "Tavily AI Agent"
+                **state["usda"],
+                "source": "usda_agent",
+                "confidence": "high"
             }
 
-    # Step 3: Fallback
-    if usda:
+        elif action == "search_tavily":
+            if tavily and state["tavily"] is None:
+                tavily_data = await fetch_with_tavily(food_name)
+                if tavily_data:
+                    tavily_data = normalize_portion_size(food_name, tavily_data)
+                    state["tavily"] = tavily_data
+
+                    return {
+                        **tavily_data,
+                        "source": "tavily_agent"
+                    }
+
+        elif action == "fallback":
+            break
+
+    # Final fallback logic
+    if state["usda"]:
         return {
-            **usda,
-            "source": "usda_partial",
+            **state["usda"],
+            "source": "usda_fallback",
             "confidence": "low"
         }
 
