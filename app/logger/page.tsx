@@ -316,152 +316,175 @@ export default function LoggerPage() {
   };
 
   const handleMicClick = async () => {
-    if (!mounted) {
-      return;
+  if (!mounted) {
+    return;
+  }
+
+  // If already listening, stop
+  if (isListening) {
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+    } else {
+      stopSpeechRecognition();
     }
+    setIsListening(false);
+    setIsRecognizing(false);
+    setInterimTranscript("");
+    // Keep persistentTranscript as is - don't clear it
+    return;
+  }
 
-    // If already listening, stop
-    if (isListening) {
-      if (mediaRecorderRef.current) {
-        mediaRecorderRef.current.stop();
-      } else {
-        stopSpeechRecognition();
-      }
-      setIsListening(false);
-      setIsRecognizing(false);
-      setInterimTranscript("");
-      // Keep persistentTranscript as is - don't clear it
-      return;
+  // If processing, don't allow new recording
+  if (isProcessing) {
+    return;
+  }
+
+  // COMPLETELY RESET EVERYTHING for new recording
+  // Cancel any ongoing recognition first
+  stopSpeechRecognition();
+  
+  // Reset all state
+  setApiData(null);
+  setPersistentTranscript("");
+  setTranscript("");
+  setInterimTranscript("");
+  setError("");
+  setStatusMessage("");
+  setSelectedFoodIndex(0);
+  setIsEditingMeal(false);
+  setEditableFoodDraft(null);
+  finalTranscriptRef.current = "";
+  
+  // Also reset the refs that might be holding old data
+  if (recognitionRef.current) {
+    try {
+      recognitionRef.current.abort();
+    } catch (e) {
+      // Ignore
     }
+    recognitionRef.current = null;
+  }
 
-    // If processing, don't allow new recording
-    if (isProcessing) {
-      return;
-    }
+  // Fallback for browsers without Web Speech API
+  if (!supportsSpeechRecognition) {
+    await startMediaRecorderFallback();
+    return;
+  }
 
-    // NEW: Reset ALL state when starting a new recording
-    resetAllState();
+  if (typeof window === "undefined") {
+    return;
+  }
 
-    // Fallback for browsers without Web Speech API
-    if (!supportsSpeechRecognition) {
-      await startMediaRecorderFallback();
-      return;
-    }
+  const speechWindow = window as Window & {
+    SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+    webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
+  };
 
-    if (typeof window === "undefined") {
-      return;
-    }
+  const SpeechRecognitionConstructor =
+    speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
 
-    const speechWindow = window as Window & {
-      SpeechRecognition?: BrowserSpeechRecognitionConstructor;
-      webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
-    };
+  if (!SpeechRecognitionConstructor) {
+    await startMediaRecorderFallback();
+    return;
+  }
 
-    const SpeechRecognitionConstructor =
-      speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+  setError("");
+  setIsListening(true);
+  setIsRecognizing(true);
 
-    if (!SpeechRecognitionConstructor) {
-      await startMediaRecorderFallback();
-      return;
-    }
+  const recognition = new SpeechRecognitionConstructor();
+  recognitionRef.current = recognition;
+  recognition.lang = "en-US";
+  recognition.interimResults = true;
+  recognition.continuous = true;
+  recognition.maxAlternatives = 1;
 
-    setError("");
+  // Use a local variable to accumulate transcript for this session
+  let localFinalTranscript = "";
+
+  recognition.onstart = () => {
     setIsListening(true);
     setIsRecognizing(true);
+    setStatusMessage("Listening... speak now");
+  };
 
-    // Stop any existing recognition
-    stopSpeechRecognition();
+  recognition.onresult = (event: BrowserSpeechRecognitionResultEvent) => {
+    let interim = "";
+    let final = "";
 
-    const recognition = new SpeechRecognitionConstructor();
-    recognitionRef.current = recognition;
-    recognition.lang = "en-US";
-    recognition.interimResults = true;
-    recognition.continuous = true;
-    recognition.maxAlternatives = 1;
-
-    recognition.onstart = () => {
-      setIsListening(true);
-      setIsRecognizing(true);
-      setStatusMessage("Listening... speak now");
-    };
-
-    recognition.onresult = (event: BrowserSpeechRecognitionResultEvent) => {
-      let interim = "";
-      let final = "";
-
-      // Process all results
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        const alternative = result[0];
-        const transcriptText = alternative.transcript;
-        
-        const isFinalResult = (result as any).isFinal === true;
-        
-        if (isFinalResult) {
-          final += transcriptText + " ";
-          finalTranscriptRef.current += transcriptText + " ";
-          // Update persistent transcript immediately when we get final text
-          setPersistentTranscript(finalTranscriptRef.current.trim());
-        } else {
-          interim += transcriptText;
-        }
-      }
-
-      // Update UI with live transcription
-      if (interim) {
-        setInterimTranscript(interim);
-        setStatusMessage("Recognizing... (keep speaking)");
+    // Process all results
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      const alternative = result[0];
+      const transcriptText = alternative.transcript;
+      
+      const isFinalResult = (result as any).isFinal === true;
+      
+      if (isFinalResult) {
+        final += transcriptText + " ";
+        localFinalTranscript += transcriptText + " ";
+        // Update persistent transcript immediately when we get final text
+        setPersistentTranscript(localFinalTranscript.trim());
       } else {
-        setInterimTranscript("");
-        if (final) {
-          setStatusMessage("Recognized!");
-        }
+        interim += transcriptText;
       }
-    };
+    }
 
-    recognition.onerror = (event: BrowserSpeechRecognitionErrorEvent) => {
-      setError(`Speech error: ${event.error}`);
-      setIsListening(false);
-      setIsRecognizing(false);
+    // Update UI with live transcription
+    if (interim) {
+      setInterimTranscript(interim);
+      setStatusMessage("Recognizing... (keep speaking)");
+    } else {
+      setInterimTranscript("");
+      if (final) {
+        setStatusMessage("Recognized!");
+      }
+    }
+  };
+
+  recognition.onerror = (event: BrowserSpeechRecognitionErrorEvent) => {
+    setError(`Speech error: ${event.error}`);
+    setIsListening(false);
+    setIsRecognizing(false);
+    setInterimTranscript("");
+    setStatusMessage("");
+    recognitionRef.current = null;
+  };
+
+  recognition.onend = async () => {
+    setIsListening(false);
+    setIsRecognizing(false);
+    
+    // Use the local variable instead of the state
+    const finalTranscript = localFinalTranscript.trim();
+    
+    // Don't process if empty
+    if (!finalTranscript) {
       setInterimTranscript("");
       setStatusMessage("");
       recognitionRef.current = null;
-    };
+      return;
+    }
 
-    recognition.onend = async () => {
-      setIsListening(false);
-      setIsRecognizing(false);
-      
-      // Use persistentTranscript which we've been updating throughout
-      const finalTranscript = persistentTranscript || finalTranscriptRef.current.trim();
-      
-      // Don't process if empty
-      if (!finalTranscript) {
-        setInterimTranscript("");
-        setStatusMessage("");
-        recognitionRef.current = null;
-        return;
-      }
-
-      // Make sure persistent transcript shows the final text
-      setPersistentTranscript(finalTranscript);
-      setIsProcessing(true);
-      
-      try {
-        await fetchByQuery(finalTranscript);
-      } catch (requestError: unknown) {
-        setError(getErrorMessage(requestError, "Failed to fetch nutrition data."));
-        setStatusMessage("");
-      } finally {
-        setIsProcessing(false);
-        setStatusMessage("");
-      }
-      
-      recognitionRef.current = null;
-    };
-
-    recognition.start();
+    // Make sure persistent transcript shows the final text
+    setPersistentTranscript(finalTranscript);
+    setIsProcessing(true);
+    
+    try {
+      await fetchByQuery(finalTranscript);
+    } catch (requestError: unknown) {
+      setError(getErrorMessage(requestError, "Failed to fetch nutrition data."));
+      setStatusMessage("");
+    } finally {
+      setIsProcessing(false);
+      setStatusMessage("");
+    }
+    
+    recognitionRef.current = null;
   };
+
+  recognition.start();
+};
 
   const handleConfirmLog = async () => {
     if (!apiData || apiData.results.length === 0 || isLogging) {
