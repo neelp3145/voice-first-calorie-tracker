@@ -731,7 +731,7 @@ async def voice_input_json(request: Request, file: UploadFile = File(...), user:
 
 def clean_voice_input(query: str):
     query = query.lower()
-    fillers = ["i ate", "i just had" "i had", "i just ate", "for breakfast", "for lunch", "for dinner"]
+    fillers = ["i ate", "i had", "i just ate", "for breakfast", "for lunch", "for dinner"]
     for f in fillers:
         query = query.replace(f, "")
     return query.strip()
@@ -869,3 +869,681 @@ async def fetch_with_tavily(food_name: str) -> Optional[Dict]:
     
     # Check cache first
     cache_key = f"tavily:{food_name.lower().strip()}"
+    cached_result = nutrition_cache.get(cache_key)
+    if cached_result:
+        logger.info(f"Cache hit for Tavily: {food_name}")
+        return cached_result
+
+    try:
+        classification = classify_food_type(food_name)
+        search_query = construct_tavily_query(food_name, classification)
+        
+        logger.info(f"Tavily search: {search_query}")
+        
+        # Use timeout wrapper
+        search_result = await asyncio.wait_for(
+            asyncio.to_thread(
+                tavily.search,
+                query=search_query,
+                search_depth="advanced",
+                max_results=5
+            ),
+            timeout=10.0
+        )
+        
+        if not search_result or not search_result.get("results"):
+            logger.info(f"No Tavily results for {food_name}")
+            return None
+        
+        # Extract and combine content from results
+        search_content = "\n".join([
+            f"Source: {r.get('title', 'Unknown')}\nContent: {r.get('content', '')[:500]}"
+            for r in search_result.get("results", [])[:3]
+        ])
+        
+        extraction_prompt = f"""
+You are a nutrition data extractor. Extract nutrition information for "{food_name}" from these search results.
+
+IMPORTANT CONTEXT:
+- Food type: {'Restaurant item' if classification['is_restaurant'] else 'Packaged product' if classification['is_packaged'] else 'Generic food'}
+- Look for OFFICIAL nutrition data from reliable sources
+- For restaurants, use their official nutrition PDFs/pages
+- For packaged foods, use the nutrition label data
+
+Return ONLY JSON in this exact format (use 0 for missing values):
+{{
+    "calories": number,
+    "protein_g": number,
+    "carbs_g": number,
+    "fat_g": number,
+    "sugar_g": number,
+    "fiber_g": number,
+    "confidence": "high" | "medium" | "low",
+    "source_url": "string or null"
+}}
+
+Search results:
+{search_content}
+
+Guidelines:
+- Calories should be per serving as listed in the source
+- If multiple values found, use the most specific to the brand/restaurant
+- Set confidence based on consistency of sources
+- HIGH confidence: official restaurant/supplement facts
+- MEDIUM: multiple sources agree
+- LOW: single source or estimates
+
+ONLY RETURN VALID JSON. NO OTHER TEXT.
+"""
+        
+        result_text = safe_groq_call(extraction_prompt, "You are a precise nutrition data extractor.")
+        
+        if not result_text:
+            return None
+        
+        nutrition_data = extract_json(result_text)
+        
+        if nutrition_data and validate_nutrition_data(nutrition_data):
+            result = {
+                "calories": nutrition_data.get("calories", 0),
+                "protein_g": nutrition_data.get("protein_g", 0),
+                "carbs_g": nutrition_data.get("carbs_g", 0),
+                "fat_g": nutrition_data.get("fat_g", 0),
+                "sugar_g": nutrition_data.get("sugar_g", 0),
+                "fiber_g": nutrition_data.get("fiber_g", 0),
+                "confidence": nutrition_data.get("confidence", "low"),
+                "source": "Tavily",
+            }
+            
+            # Cache the result
+            nutrition_cache.set(cache_key, result)
+            return result
+        
+        return None
+        
+    except asyncio.TimeoutError:
+        logger.error(f"Tavily search timeout for {food_name}")
+        return None
+    except Exception as e:
+        logger.error(f"Tavily fetch failed for {food_name}: {str(e)}")
+        return None
+
+async def fetch_usda(food_name: str) -> Optional[Dict]:
+    """Fetch nutrition data from USDA with caching"""
+    cache_key = f"usda:{food_name.lower().strip()}"
+    cached_result = nutrition_cache.get(cache_key)
+    if cached_result:
+        logger.info(f"Cache hit for USDA: {food_name}")
+        return cached_result
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                "https://api.nal.usda.gov/fdc/v1/foods/search",
+                params={"api_key": USDA_API_KEY},
+                json={"query": food_name, "pageSize": 10, "requireAllWords": False}
+            )
+
+            if response.status_code != 200:
+                return None
+
+            foods = response.json().get("foods", [])
+            if not foods:
+                return None
+
+            selected = select_usda_candidate(food_name, foods)
+            if not selected:
+                return None
+
+            lookup = {
+                "Energy": "calories",
+                "Protein": "protein_g",
+                "Carbohydrate, by difference": "carbs_g",
+                "Total lipid (fat)": "fat_g",
+                "Sugars, total including NLEA": "sugar_g",
+                "Fiber, total dietary": "fiber_g",
+                "Vitamin D (D2 + D3), International Units": "vitamin_d_mcg"
+            }
+
+            nutrition = {v: 0 for v in lookup.values()}
+            nutrition["food_description"] = selected.get("description", "")
+
+            for n in selected.get("foodNutrients", []):
+                if n.get("nutrientName") in lookup:
+                    nutrition[lookup[n["nutrientName"]]] = n.get("value", 0)
+
+            # Normalize portion sizes for known foods
+            nutrition = normalize_portion_size(food_name, nutrition)
+            
+            # Cache the result
+            nutrition_cache.set(cache_key, nutrition)
+            return nutrition
+            
+    except Exception as e:
+        logger.error(f"USDA fetch failed for {food_name}: {str(e)}")
+        return None
+
+def normalize_portion_size(food_name: str, nutrition: dict) -> dict:
+    """Normalize nutrition values to typical serving sizes"""
+    if not nutrition:
+        return nutrition
+    
+    food_lower = food_name.lower()
+    
+    # Special case for eggs - USDA often returns per 100g instead of per egg
+    if "egg" in food_lower.split():
+        logger.info(f"Forcing correct egg nutrition for '{food_name}'")
+        return {
+            "calories": 72.0,
+            "protein_g": 6.3,
+            "carbs_g": 0.5,
+            "fat_g": 4.8,
+            "sugar_g": 0.2,
+            "fiber_g": 0,
+            "vitamin_d_mcg": 1.0,
+            "food_description": "Egg, whole, large",
+        }
+    
+    # Define typical portion sizes (grams per typical serving)
+    portion_rules = [
+        (["chicken breast"], 150),
+        (["chicken thigh"], 120),
+        (["steak"], 150),
+        (["burger patty"], 113),
+        (["toast", "slice of bread"], 35),
+        (["apple"], 150),
+        (["banana"], 120),
+        (["orange"], 130),
+        (["carrot"], 61),
+        (["broccoli"], 85),
+        (["cheese slice"], 20),
+        (["yogurt"], 150),
+        (["rice cooked"], 150),
+        (["pasta cooked"], 150),
+    ]
+    
+    for keywords, grams_per_serving in portion_rules:
+        if any(keyword in food_lower for keyword in keywords):
+            multiplier = grams_per_serving / 100
+            adjusted_nutrition = {}
+            for key, value in nutrition.items():
+                if isinstance(value, (int, float)) and key not in ["food_description"]:
+                    adjusted_nutrition[key] = round(value * multiplier, 2)
+                else:
+                    adjusted_nutrition[key] = value
+            logger.info(f"Normalized '{food_name}': multiplier {multiplier:.2f}")
+            return adjusted_nutrition
+    
+    return nutrition
+
+async def fetch_personal_food(user_id: str, food_name: str) -> Optional[Dict]:
+    """Fetch personal food entry from database"""
+    client = get_admin_supabase_or_503()
+    
+    try:
+        response = (
+            client.table("personal_foods")
+            .select("food_name, calories, protein, carbs, fat")
+            .eq("user_id", user_id)
+            .execute()
+        )
+    except Exception as exc:
+        translated = _translate_supabase_error(exc)
+        logger.exception("Failed to search personal foods")
+        raise translated
+
+    best_match = None
+    best_score = 0
+    for row in response.data or []:
+        score = _personal_food_match_score(food_name, row.get("food_name", ""))
+        if score > best_score:
+            best_score = score
+            best_match = row
+
+    if not best_match:
+        return None
+
+    return {
+        "food": best_match.get("food_name", food_name),
+        "nutrition": {
+            "calories": best_match.get("calories", 0) or 0,
+            "protein_g": best_match.get("protein", 0) or 0,
+            "carbs_g": best_match.get("carbs", 0) or 0,
+            "fat_g": best_match.get("fat", 0) or 0,
+            "sugar_g": 0,
+            "fiber_g": 0,
+            "vitamin_d_mcg": 0,
+        },
+        "source": "personal",
+    }
+
+def _personal_food_match_score(query: str, food_name: str) -> int:
+    """Calculate match score between query and personal food name"""
+    normalized_query = normalize_food_text(query)
+    normalized_food_name = normalize_food_text(food_name)
+    
+    if not normalized_query or not normalized_food_name:
+        return 0
+    
+    if normalized_query == normalized_food_name:
+        return 1000
+    
+    if normalized_food_name in normalized_query:
+        return 900 + len(normalized_food_name)
+    
+    query_tokens = set(normalized_query.split())
+    food_tokens = set(normalized_food_name.split())
+    if food_tokens and food_tokens.issubset(query_tokens):
+        return 700 + len(normalized_food_name)
+    
+    return 0
+
+def normalize_food_text(text: str) -> str:
+    """Normalize food text for comparison"""
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+def select_usda_candidate(query: str, foods: list) -> dict:
+    """Select best USDA candidate based on scoring"""
+    scored = sorted(
+        ((score_usda_candidate(query, food), food) for food in foods),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    
+    if not scored:
+        return {}
+    
+    if len(scored) == 1:
+        return scored[0][1]
+    
+    best_score, best_candidate = scored[0]
+    second_score, _ = scored[1]
+    
+    # If close scores and brand-like query, use AI to decide
+    if is_brand_like_query(query) and best_score - second_score <= 8:
+        ai_choice = select_usda_candidate_with_ai(query, [candidate for _, candidate in scored[:5]])
+        if ai_choice is not None and 0 <= ai_choice < min(len(scored), 5):
+            return scored[ai_choice][1]
+    
+    return best_candidate
+
+def score_usda_candidate(query: str, candidate: dict) -> float:
+    """Score USDA candidate based on relevance"""
+    normalized_query = normalize_food_text(query)
+    query_tokens = [token for token in normalized_query.split() if token]
+    candidate_tokens = set(normalize_food_text(candidate.get("description", "")).split())
+    
+    score = 0.0
+    
+    if normalized_query and normalized_query == normalize_food_text(candidate.get("description", "")):
+        score += 120
+    
+    for token in query_tokens:
+        if token in candidate_tokens:
+            score += 12
+    
+    if candidate.get("dataType") == "Branded":
+        score += 18
+    
+    if candidate.get("brandOwner"):
+        if any(token in normalize_food_text(candidate.get("brandOwner", "")) for token in query_tokens):
+            score += 25
+    
+    if is_brand_like_query(query):
+        if candidate.get("dataType") == "Branded":
+            score += 12
+        else:
+            score -= 12
+    
+    return score
+
+def is_brand_like_query(query: str) -> bool:
+    """Check if query appears to be a branded product"""
+    normalized = normalize_food_text(query)
+    tokens = [token for token in normalized.split() if token]
+    if not tokens:
+        return False
+    
+    brand_terms = {
+        "maggi", "oreo", "coke", "pepsi", "lays", "kitkat",
+        "kelloggs", "kellogg", "nestle", "nutella", "doritos",
+        "pringles", "fanta", "sprite", "snickers", "twix"
+    }
+    
+    return len(tokens) <= 3 or any(token in brand_terms for token in tokens)
+
+def select_usda_candidate_with_ai(query: str, foods: list) -> Optional[int]:
+    """Use AI to select best USDA candidate"""
+    payload = []
+    for index, food in enumerate(foods):
+        payload.append({
+            "index": index,
+            "description": food.get("description"),
+            "brandOwner": food.get("brandOwner"),
+            "brandName": food.get("brandName"),
+            "dataType": food.get("dataType"),
+            "foodCategory": food.get("foodCategory"),
+        })
+    
+    prompt = (
+        "Choose the single best USDA food candidate for the user's intended food. "
+        "Prefer the packaged product the user most likely means, not a loose ingredient or condiment. "
+        "Return only JSON: {\"selected_index\": number}.\n\n"
+        f"User query: {query}\n"
+        f"Candidates: {json.dumps(payload, ensure_ascii=False)}"
+    )
+    
+    text = safe_groq_call(prompt, "You are a strict food resolver that returns only JSON.")
+    data = extract_json(text) if text else None
+    if isinstance(data, dict) and isinstance(data.get("selected_index"), int):
+        return data["selected_index"]
+    
+    return None
+
+# ------------------ ENHANCED AGENT LOOP ------------------
+
+async def fetch_nutrition_agent(food_name: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    TRUE MULTI-STEP AGENT LOOP:
+    1. Check personal foods first (if user_id provided)
+    2. Try USDA
+    3. Evaluate USDA quality
+    4. Try Tavily if USDA insufficient
+    5. Compare results
+    6. Fallback if needed
+    """
+    
+    state = {
+        "food": food_name,
+        "personal_food": None,
+        "usda": None,
+        "tavily": None,
+        "best_result": None,
+        "attempts": 0,
+    }
+    
+    # Step 1: Check personal foods first (fastest, most personalized)
+    if user_id:
+        try:
+            personal_food = await fetch_personal_food(user_id, food_name)
+            if personal_food:
+                state["personal_food"] = personal_food
+                logger.info(f"[AGENT] Found personal food for '{food_name}'")
+                return {
+                    **personal_food["nutrition"],
+                    "source": "personal",
+                    "confidence": "high",
+                }
+        except Exception as e:
+            logger.warning(f"Personal food lookup failed: {e}")
+    
+    # Step 2: Try USDA
+    logger.info(f"[AGENT] Fetching USDA data for '{food_name}'")
+    usda_data = await fetch_usda(food_name)
+    if usda_data:
+        usda_data = normalize_portion_size(food_name, usda_data)
+        state["usda"] = usda_data
+    
+    # Step 3: Evaluate if USDA result is good enough
+    if state["usda"] and is_usda_result_reliable(state["usda"], food_name):
+        logger.info(f"[AGENT] USDA result reliable for '{food_name}'")
+        return {
+            **{k: v for k, v in state["usda"].items() if k not in ["food_description"]},
+            "source": "USDA",
+            "confidence": "high",
+        }
+    
+    # Step 4: USDA insufficient or missing, try Tavily
+    if tavily:
+        logger.info(f"[AGENT] Trying Tavily for '{food_name}'")
+        tavily_data = await fetch_with_tavily(food_name)
+        if tavily_data:
+            tavily_data = normalize_portion_size(food_name, tavily_data)
+            state["tavily"] = tavily_data
+            
+            # If we have both USDA and Tavily, use agent to decide
+            if state["usda"] and state["tavily"]:
+                decision = agent_compare_results(food_name, state["usda"], state["tavily"])
+                if decision == "tavily":
+                    logger.info(f"[AGENT] Agent chose Tavily over USDA for '{food_name}'")
+                    return {
+                        **{k: v for k, v in state["tavily"].items() if k not in ["source", "confidence"]},
+                        "source": "Tavily",
+                        "confidence": state["tavily"].get("confidence", "medium"),
+                    }
+            
+            # No USDA or agent chose USDA, but Tavily is valid
+            if not state["usda"]:
+                logger.info(f"[AGENT] Using Tavily result for '{food_name}'")
+                return {
+                    **{k: v for k, v in state["tavily"].items() if k not in ["source", "confidence"]},
+                    "source": "Tavily",
+                    "confidence": state["tavily"].get("confidence", "medium"),
+                }
+    
+    # Step 5: Fallback - use whatever we have
+    if state["usda"]:
+        logger.info(f"[AGENT] Using USDA fallback for '{food_name}'")
+        return {
+            **{k: v for k, v in state["usda"].items() if k not in ["food_description"]},
+            "source": "USDA (fallback)",
+            "confidence": "low",
+        }
+    
+    # Step 6: Complete fallback - no data available
+    logger.info(f"[AGENT] No data available for '{food_name}'")
+    return {
+        "calories": 0,
+        "protein_g": 0,
+        "carbs_g": 0,
+        "fat_g": 0,
+        "sugar_g": 0,
+        "fiber_g": 0,
+        "source": "none",
+        "confidence": "none",
+    }
+
+def agent_compare_results(food_name: str, usda_data: Dict, tavily_data: Dict) -> str:
+    """Use AI to compare USDA and Tavily results and choose the best one"""
+    prompt = f"""
+Compare these two nutrition data sources for "{food_name}" and choose the more accurate one.
+
+USDA Data:
+{json.dumps(usda_data, indent=2)}
+
+Tavily Data:
+{json.dumps(tavily_data, indent=2)}
+
+Consider:
+1. Which source is more likely correct for this specific food?
+2. Are the calorie counts realistic for a typical serving?
+3. Does the macro split make sense for this food type?
+4. For branded/restaurant foods, Tavily might have more specific data
+
+Return ONLY JSON: {{"choice": "usda" | "tavily", "reason": "brief explanation"}}
+"""
+    
+    text = safe_groq_call(prompt, "You are a nutrition data validation expert.")
+    data = extract_json(text) if text else None
+    
+    if isinstance(data, dict) and data.get("choice") in ["usda", "tavily"]:
+        return data["choice"]
+    
+    # Default to Tavily for branded foods, USDA for generic
+    food_lower = food_name.lower()
+    if any(brand in food_lower for brand in ["chipotle", "starbucks", "mcdonald", "burger king"]):
+        return "tavily"
+    return "usda"
+
+def is_usda_result_reliable(nutrition: dict, query: str = "") -> bool:
+    """Enhanced reliability check for USDA results"""
+    if not nutrition:
+        return False
+    
+    query_lower = query.lower()
+    
+    # Special cases for known problem foods
+    if "egg" in query_lower.split():
+        calories = nutrition.get("calories", 0)
+        if calories > 100:
+            logger.info(f"Egg with {calories} cal marked unreliable (should be ~72)")
+            return False
+    
+    # Check for branded foods that USDA often gets wrong
+    brand_patterns = [
+        "chipotle", "starbucks", "mcdonald", "wendy", "burger king",
+        "taco bell", "kfc", "subway", "panera", "dunkin",
+    ]
+    
+    for brand in brand_patterns:
+        if brand in query_lower:
+            food_desc = str(nutrition.get("food_description", "")).lower()
+            if brand not in food_desc:
+                logger.info(f"Brand '{brand}' not in USDA result - unreliable")
+                return False
+    
+    # Basic validation
+    calories = nutrition.get("calories", 0)
+    protein = nutrition.get("protein_g", 0)
+    carbs = nutrition.get("carbs_g", 0)
+    fat = nutrition.get("fat_g", 0)
+    
+    if not (0 < calories <= 5000):
+        return False
+    
+    # Macros shouldn't exceed calories (rough check)
+    macro_calories = (protein * 4) + (carbs * 4) + (fat * 9)
+    if macro_calories > calories * 1.5:  # Allow 50% margin for fiber, etc.
+        return False
+    
+    return True
+
+# ------------------ FOOD EXTRACTION ------------------
+
+async def extract_foods_with_ai(query: str) -> List[Dict]:
+    """Extract food items from natural language query"""
+    text = safe_groq_call(query, FOOD_PARSER_PROMPT)
+    
+    if not text:
+        return [{"food": query, "quantity": 1}]
+    
+    data = extract_json(text)
+    
+    if isinstance(data, list):
+        foods = validate_foods(data)
+        if not foods:
+            return [{"food": query, "quantity": 1}]
+        return foods
+    
+    elif isinstance(data, dict) and "dish" in data:
+        return [{"food": data["dish"], "quantity": estimate_portion(query)}]
+    
+    logger.warning("AI returned unexpected format: %s", text)
+    return [{"food": query, "quantity": 1}]
+
+def validate_foods(data: List) -> List[Dict]:
+    """Validate and clean food items"""
+    clean = []
+    for item in data:
+        try:
+            clean_item = {
+                "food": str(item["food"]).strip(),
+                "quantity": float(item.get("quantity", 1)),
+            }
+            
+            if clean_item["quantity"] <= 0:
+                clean_item["quantity"] = 1
+            
+            for optional_key in ("brand", "intent", "unit"):
+                if optional_key in item and item[optional_key]:
+                    clean_item[optional_key] = item[optional_key]
+            
+            clean.append(clean_item)
+        except:
+            continue
+    
+    return clean
+
+def estimate_portion(text: str) -> float:
+    """Estimate portion size from text"""
+    try:
+        result = safe_groq_call(
+            text,
+            """Return ONLY JSON: {"quantity": number}
+            Rules:
+            - "a", "an" = 1
+            - "one" = 1, "two" = 2, etc.
+            - "half" = 0.5
+            - If nothing specified -> 1"""
+        )
+        data = extract_json(result) if result else None
+        return float(data.get("quantity", 1)) if data else 1
+    except:
+        return 1
+
+# ------------------ PROCESS RESULTS ------------------
+
+async def compute_results_and_totals(foods: List[Dict], user_id: Optional[str] = None) -> Tuple[List[Dict], Dict]:
+    """Compute nutrition results and totals from food items"""
+    results = []
+    totals = {
+        "calories": 0,
+        "protein_g": 0,
+        "carbs_g": 0,
+        "fat_g": 0
+    }
+    
+    for food in foods:
+        food_item = food.get("food", "")
+        quantity = float(food.get("quantity", 1))
+        brand = food.get("brand")
+        
+        # Build search query with brand if available
+        search_query = food_item
+        if brand and brand.lower() not in normalize_food_text(food_item):
+            search_query = f"{brand} {food_item}".strip()
+        
+        # Get nutrition data through agent
+        nutrition_data = await fetch_nutrition_agent(search_query, user_id=user_id)
+        
+        # Extract nutrition values
+        nutrition = {
+            "calories": nutrition_data.get("calories", 0),
+            "protein_g": nutrition_data.get("protein_g", 0),
+            "carbs_g": nutrition_data.get("carbs_g", 0),
+            "fat_g": nutrition_data.get("fat_g", 0),
+            "sugar_g": nutrition_data.get("sugar_g", 0),
+            "fiber_g": nutrition_data.get("fiber_g", 0),
+            "vitamin_d_mcg": nutrition_data.get("vitamin_d_mcg", 0),
+        }
+        
+        source = nutrition_data.get("source", "none")
+        confidence = nutrition_data.get("confidence", "none")
+        
+        # Multiply by quantity
+        for key in totals:
+            val = nutrition.get(key, 0)
+            if isinstance(val, (int, float)):
+                totals[key] += val * quantity
+        
+        # Create result entry
+        label = f"{quantity:g} x {food_item}" if quantity != 1 else food_item
+        
+        results.append({
+            "food": label,
+            "quantity": quantity,
+            "source": source,
+            "source_item": food_item,
+            "confidence": confidence,
+            **nutrition,
+        })
+    
+    return results, totals
+
+async def process_foods(request: Request, foods: List[Dict], transcript: Optional[str] = None):
+    """Process foods and return results"""
+    results, totals = await compute_results_and_totals(foods)
+    payload = {"results": results, "totals": totals}
+    if transcript is not None:
+        payload["transcript"] = transcript
+    return payload
